@@ -1,0 +1,59 @@
+{
+  "file_path": "/Users/jucat/data/ashare/preprocessed/百联股份_600827.csv",
+  "show_days": 160,
+  "offset": 4605,
+  "sub_wins": [
+    {
+      "series": [
+        {
+          "column": "收盘价",
+          "side": "left"
+        },
+        {
+          "column": "M5C",
+          "side": "left"
+        },
+        {
+          "column": "SNC",
+          "side": "right"
+        }
+      ]
+    },
+    {
+      "series": [
+        {
+          "column": "M21V",
+          "side": "left"
+        },
+        {
+          "column": "M5V",
+          "side": "left"
+        },
+        {
+          "column": "SNV",
+          "side": "right"
+        },
+        {
+          "column": "成交量",
+          "side": "left"
+        }
+      ]
+    },
+    {
+      "series": [
+        {
+          "column": "M5H",
+          "side": "left"
+        },
+        {
+          "column": "M5L",
+          "side": "left"
+        },
+        {
+          "column": "M21C",
+          "side": "left"
+        }
+      ]
+    }
+  ]
+}

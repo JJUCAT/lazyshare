@@ -1,0 +1,77 @@
+
+===== 2026-08-23T10:17:23 GUI 启动 =====
+
+===== 2026-08-23T10:17:51 GUI 异常 =====
+Traceback (most recent call last):
+  File "/Users/jucat/ws/lazyshare/src/gui/ui/main_window.py", line 104, in add_data
+    result = AddDataDialog.ask(self._store, self._model, self)
+  File "/Users/jucat/ws/lazyshare/src/gui/ui/dialogs.py", line 110, in ask
+    dlg = AddDataDialog(data_store, model, parent)
+  File "/Users/jucat/ws/lazyshare/src/gui/ui/dialogs.py", line 81, in __init__
+    self._update_ok_state()
+  File "/Users/jucat/ws/lazyshare/src/gui/ui/dialogs.py", line 89, in _update_ok_state
+    btn.setEnabled(bool(self.selected_columns()))
+  File "/Users/jucat/ws/lazyshare/src/gui/ui/dialogs.py", line 98, in selected_columns
+    return [item.text() for item in self._column_list
+TypeError: 'PySide6.QtWidgets.QListWidget' object is not iterable
+
+
+===== 2026-08-23T10:18:01 GUI 异常 =====
+Traceback (most recent call last):
+  File "/Users/jucat/ws/lazyshare/src/gui/ui/main_window.py", line 104, in add_data
+    result = AddDataDialog.ask(self._store, self._model, self)
+  File "/Users/jucat/ws/lazyshare/src/gui/ui/dialogs.py", line 110, in ask
+    dlg = AddDataDialog(data_store, model, parent)
+  File "/Users/jucat/ws/lazyshare/src/gui/ui/dialogs.py", line 81, in __init__
+    self._update_ok_state()
+  File "/Users/jucat/ws/lazyshare/src/gui/ui/dialogs.py", line 89, in _update_ok_state
+    btn.setEnabled(bool(self.selected_columns()))
+  File "/Users/jucat/ws/lazyshare/src/gui/ui/dialogs.py", line 98, in selected_columns
+    return [item.text() for item in self._column_list
+TypeError: 'PySide6.QtWidgets.QListWidget' object is not iterable
+
+
+===== 2026-08-23T10:18:21 GUI 异常 =====
+Traceback (most recent call last):
+  File "/Users/jucat/ws/lazyshare/src/gui/ui/main_window.py", line 104, in add_data
+    result = AddDataDialog.ask(self._store, self._model, self)
+  File "/Users/jucat/ws/lazyshare/src/gui/ui/dialogs.py", line 110, in ask
+    dlg = AddDataDialog(data_store, model, parent)
+  File "/Users/jucat/ws/lazyshare/src/gui/ui/dialogs.py", line 81, in __init__
+    self._update_ok_state()
+  File "/Users/jucat/ws/lazyshare/src/gui/ui/dialogs.py", line 89, in _update_ok_state
+    btn.setEnabled(bool(self.selected_columns()))
+  File "/Users/jucat/ws/lazyshare/src/gui/ui/dialogs.py", line 98, in selected_columns
+    return [item.text() for item in self._column_list
+TypeError: 'PySide6.QtWidgets.QListWidget' object is not iterable
+
+
+===== 2026-08-23T10:19:49 GUI 启动 =====
+
+===== 2026-08-23T10:21:48 GUI 启动 =====
+
+===== 2026-08-23T10:27:01 GUI 启动 =====
+
+===== 2026-08-23T10:32:24 GUI 启动 =====
+
+===== 2026-08-23T10:36:01 GUI 启动 =====
+
+===== 2026-08-23T10:51:49 GUI 启动 =====
+
+===== 2026-08-23T11:06:12 GUI 启动 =====
+
+===== 2026-08-23T11:16:50 GUI 启动 =====
+
+===== 2026-08-23T11:36:51 GUI 启动 =====
+
+===== 2026-08-23T11:38:05 GUI 启动 =====
+
+===== 2026-08-23T11:40:34 GUI 启动 =====
+
+===== 2026-08-23T11:41:43 GUI 启动 =====
+
+===== 2026-08-23T11:42:07 GUI 启动 =====
+
+===== 2026-08-23T11:53:41 GUI 启动 =====
+
+===== 2026-08-23T11:55:40 GUI 启动 =====

@@ -10,6 +10,8 @@
     M5C  : 5 日收盘价均值
     M21V : 21 日成交量均值
     M5V  : 5 日成交量均值
+    M5H  : 5 日最高价均值
+    M5L  : 5 日最低价均值
     NC   : (M5C - M21C) / M21C
     NV   : (M5V - M21V) / M21V
     SNC  : NC 的累计值
@@ -19,7 +21,9 @@
     - 某日期 A 的 M21 为 A 及此前 20 个交易日的均值（窗口为 21，含当日）。
       若截至该日期的历史天数不足 21 天，则该日期没有 M21 数据（空值），
       M5 / NC / NV / SNC / SNV 同理按各自窗口处理。
-    - 均值、归一化值均由原始"收盘价 / 成交量"重新计算，不沿用原文件中的均线列。
+    - 输出包含原始"成交量"列，以及由原始"收盘价 / 成交量 / 最高价 / 最低价"
+      重新计算的均值（M21C / M5C / M21V / M5V / M5H / M5L）与归一化值，
+      不沿用原文件中的均线列。
     - 输出为 CSV，文件名为股票名称；若股票名称重复，则追加股票代码以区分。
     - 原始数据路径与输出路径从 config/preprocess.json 读取。
     - 使用多进程并行处理，worker 数量默认取本机 CPU 核心数的一半。
@@ -59,6 +63,8 @@ COL_CODE = "代码"
 COL_NAME = "名称"
 COL_INDUSTRY = "所属行业"
 COL_CLOSE = "收盘价"
+COL_HIGH = "最高价"
+COL_LOW = "最低价"
 COL_VOLUME = "成交量（股）"
 
 # 输出列
@@ -68,10 +74,13 @@ OUTPUT_COLUMNS = [
     "股票名称",
     "行业",
     "收盘价",
+    "成交量",
     "M21C",
     "M5C",
     "M21V",
     "M5V",
+    "M5H",
+    "M5L",
     "NC",
     "NV",
     "SNC",
@@ -81,10 +90,13 @@ OUTPUT_COLUMNS = [
 # 需要保留 3 位小数的浮点列
 FLOAT_COLUMNS = [
     "收盘价",
+    "成交量",
     "M21C",
     "M5C",
     "M21V",
     "M5V",
+    "M5H",
+    "M5L",
     "NC",
     "NV",
     "SNC",
@@ -171,6 +183,8 @@ def process_file(task: tuple[Path, Path]) -> dict:
     industry = str(df[COL_INDUSTRY].iloc[-1]).strip()
 
     close = pd.to_numeric(df[COL_CLOSE], errors="coerce")
+    high = pd.to_numeric(df[COL_HIGH], errors="coerce")
+    low = pd.to_numeric(df[COL_LOW], errors="coerce")
     volume = pd.to_numeric(df[COL_VOLUME], errors="coerce")
 
     # 移动均值：窗口含当日，天数不足时为 NaN
@@ -178,6 +192,8 @@ def process_file(task: tuple[Path, Path]) -> dict:
     m5c = close.rolling(window=CLOSE_WINDOW_5, min_periods=CLOSE_WINDOW_5).mean()
     m21v = volume.rolling(window=VOLUME_WINDOW, min_periods=VOLUME_WINDOW).mean()
     m5v = volume.rolling(window=VOLUME_WINDOW_5, min_periods=VOLUME_WINDOW_5).mean()
+    m5h = high.rolling(window=VOLUME_WINDOW_5, min_periods=VOLUME_WINDOW_5).mean()
+    m5l = low.rolling(window=VOLUME_WINDOW_5, min_periods=VOLUME_WINDOW_5).mean()
 
     # 归一化值
     nc = (m5c - m21c) / m21c
@@ -194,10 +210,13 @@ def process_file(task: tuple[Path, Path]) -> dict:
             "股票名称": name,
             "行业": industry,
             "收盘价": close,
+            "成交量": volume,
             "M21C": m21c,
             "M5C": m5c,
             "M21V": m21v,
             "M5V": m5v,
+            "M5H": m5h,
+            "M5L": m5l,
             "NC": nc,
             "NV": nv,
             "SNC": snc,
