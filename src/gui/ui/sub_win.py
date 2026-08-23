@@ -11,6 +11,7 @@ from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
+from ..business.data_store import CLOSE_COLUMN, PEAK_LABEL_COLUMN
 from .chart_utils import calc_ticks, format_tick, series_range, short_date
 
 # 布局常量
@@ -32,6 +33,9 @@ COLOR_TEXT = QColor("#d8d8d8")
 
 # 绘制点数过多时的阈值（超过则关闭抗锯齿、不画数据点标记）
 DENSE_THRESHOLD = 400
+
+# 峰值标签固定大小（不受缩放影响）
+PEAK_LABEL_SIZE = 14.0
 
 
 class SubWinWidget(QWidget):
@@ -169,6 +173,7 @@ class SubWinWidget(QWidget):
         self._draw_hgrid(painter, plot, left_series, right_series, offset, show)
         self._draw_highlight(painter, plot, offset, show)
         self._draw_series_lines(painter, plot, left_series, right_series, offset, show, dense)
+        self._draw_peak_labels(painter, plot, offset, show)
         self._draw_axis_ticks(painter, plot, left_series, right_series, offset, show)
         self._draw_date_axis(painter, plot, dates, offset, show)
         self._draw_border(painter, plot)
@@ -264,6 +269,57 @@ class SubWinWidget(QWidget):
         # 左纵列先画，右纵列后画（右纵列在上层）
         self._draw_side(painter, plot, left_series, offset, show, dense)
         self._draw_side(painter, plot, right_series, offset, show, dense)
+
+    def _draw_peak_labels(self, painter: QPainter, plot: QRectF,
+                          offset: int, show: int) -> None:
+        """在“收盘价”曲线数据点上方绘制峰值标签（T 红 / B 绿）。
+
+        仅当 sub_win 含有“收盘价”曲线且数据含“峰值标签”列时绘制。
+        """
+        close_series = next(
+            (s for s in self.subwin.series if s.column == CLOSE_COLUMN), None)
+        if close_series is None:
+            return
+        labels = self._model.data_store.get_peak_labels()
+        if labels is None or len(labels) == 0:
+            return
+        vmin, vmax = series_range([close_series], offset, show)
+        if vmin is None:
+            return
+        # 固定大小、不受缩放影响；始终绘制（时间柱过窄时也显示）
+        size = PEAK_LABEL_SIZE
+        col_w = self._col_width(plot)
+        for i in range(show):
+            idx = offset + i
+            if idx < 0 or idx >= len(labels):
+                continue
+            lab = str(labels[idx]).strip()
+            if lab not in ("T", "B"):
+                continue
+            v = close_series.values[idx]
+            if not np.isfinite(v):
+                continue
+            x = plot.left() + (i + 0.5) * col_w
+            y = plot.bottom() - (float(v) - vmin) / (vmax - vmin) * plot.height()
+            self._draw_peak_marker(painter, x, y, size, lab, plot)
+
+    def _draw_peak_marker(self, painter: QPainter, x: float, y: float,
+                          size: float, lab: str, plot: QRectF) -> None:
+        """绘制单个峰值标签：彩色正方形 + 中间白色镂空字母。"""
+        top = max(plot.top(), y - size - 3.0)
+        rect = QRectF(x - size / 2.0, top, size, size)
+        color = QColor("#e6194b") if lab == "T" else QColor("#3cb44b")
+        painter.save()
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(color)
+        painter.drawRect(rect)
+        painter.setPen(QColor("#ffffff"))
+        font = painter.font()
+        font.setBold(True)
+        font.setPixelSize(max(7, int(size * 0.58)))
+        painter.setFont(font)
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, lab)
+        painter.restore()
 
     def _draw_side(self, painter: QPainter, plot: QRectF, series_list,
                    offset: int, show: int, dense: bool) -> None:

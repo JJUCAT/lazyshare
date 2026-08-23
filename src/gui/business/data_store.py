@@ -10,6 +10,10 @@ import pandas as pd
 # CSV 中的标识列（不作为图表数值列）
 IDENTITY_COLUMNS = ("日期", "股票代码", "股票名称", "行业")
 
+# 峰值标签列（T/B 字符串，不作为普通数值曲线，用于收盘价上方标注）
+PEAK_LABEL_COLUMN = "峰值标签"
+CLOSE_COLUMN = "收盘价"
+
 
 class DataStore:
     """保存当前打开的 CSV 文件数据，并提供给 UI / 模型使用。
@@ -23,6 +27,7 @@ class DataStore:
         self._df: pd.DataFrame | None = None
         self._values: dict[str, np.ndarray] = {}
         self._dates: np.ndarray | None = None
+        self._peak_labels: np.ndarray | None = None
         self._listeners: list[callable] = []
 
     # ------------------------------------------------------------------
@@ -59,6 +64,7 @@ class DataStore:
         self._df = None
         self._values = {}
         self._dates = None
+        self._peak_labels = None
         self._notify()
 
     # ------------------------------------------------------------------
@@ -92,6 +98,11 @@ class DataStore:
         """返回某列的 float 数组（缺失值为 NaN），列不存在时返回空数组。"""
         return self._values.get(column, np.array([]))
 
+    def get_peak_labels(self) -> np.ndarray:
+        """返回峰值标签数组（'' / 'T' / 'B'），无此列时返回空数组。"""
+        return (self._peak_labels if self._peak_labels is not None
+                else np.array([], dtype=object))
+
     def get_title_info(self) -> dict:
         """从 CSV 列项读取标题信息（股票名称、代码、行业、日期范围）。"""
         if self._df is None or self._df.empty:
@@ -114,7 +125,14 @@ class DataStore:
     # ------------------------------------------------------------------
     def _cache_columns(self) -> None:
         self._values = {}
+        self._peak_labels = np.array([], dtype=object)
         for col in self._df.columns:
+            if col == PEAK_LABEL_COLUMN:
+                self._peak_labels = np.array(
+                    [str(x) if pd.notna(x) else "" for x in self._df[col]],
+                    dtype=object,
+                )
+                continue
             try:
                 arr = pd.to_numeric(self._df[col], errors="coerce").to_numpy(
                     dtype=float
