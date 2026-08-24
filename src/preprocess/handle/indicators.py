@@ -37,6 +37,7 @@ OUTPUT_COLUMNS = [
     "SNC",
     "SNV",
     "SNB",
+    "M21SNB",
     "峰值标签",
 ]
 
@@ -54,6 +55,7 @@ FLOAT_COLUMNS = [
     "SNC",
     "SNV",
     "SNB",
+    "M21SNB",
 ]
 
 # 文件名中不允许的字符（替换为下划线）
@@ -83,7 +85,7 @@ def compute_indicators(df) -> dict:
     """计算各项指标序列（收盘/最高/最低/成交量及其均值、归一化、累计）。
 
     返回 dict，键为：close / high / low / volume / m21c / m21v /
-    nc / nv / na / nbear / nbull / snc / snv / snb。
+    nc / nv / na / nbear / nbull / snc / snv / snb / m21snb。
     """
     close = pd.to_numeric(df[COL_CLOSE], errors="coerce")
     high = pd.to_numeric(df[COL_HIGH], errors="coerce")
@@ -94,22 +96,25 @@ def compute_indicators(df) -> dict:
     m21c = close.rolling(window=CLOSE_WINDOW, min_periods=CLOSE_WINDOW).mean()
     m21v = volume.rolling(window=VOLUME_WINDOW, min_periods=VOLUME_WINDOW).mean()
 
-    # 归一化值（以 M21C 为基准）
+    # 归一化值（以收盘价为基准）
     nc = (close - m21c) / m21c
     nv = (volume - m21v) / m21v
-    na = (high - low) / m21c
-    nbear = (high - close) / m21c
-    nbull = (close - low) / m21c
+    na = (high - low) / close
+    nbear = (high - close) / close
+    nbull = (close - low) / close
 
     # 累计值
     snc = nc.cumsum()
     snv = nv.cumsum()
     snb = (nbull - nbear).cumsum()
 
+    # SNB 的 21 日均值
+    m21snb = snb.rolling(window=CLOSE_WINDOW, min_periods=CLOSE_WINDOW).mean()
+
     return {
         "close": close, "high": high, "low": low, "volume": volume,
         "m21c": m21c, "m21v": m21v,
         "nc": nc, "nv": nv, "na": na,
         "nbear": nbear, "nbull": nbull,
-        "snc": snc, "snv": snv, "snb": snb,
+        "snc": snc, "snv": snv, "snb": snb, "m21snb": m21snb,
     }

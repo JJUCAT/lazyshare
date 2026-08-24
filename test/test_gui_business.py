@@ -2,6 +2,7 @@
 """business 层单元测试：DataStore / ChartModel / 预处理峰值标签。"""
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -16,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.gui.business.chart_model import DEFAULT_SHOW_DAYS, ChartModel
 from src.gui.business.data_store import DataStore
+from src.gui.business.window_config import WindowConfig, extract_display_config
 from src.preprocess.handle.indicators import is_st_stock
 from src.preprocess.label.peak import compute_peak_labels
 
@@ -152,12 +154,72 @@ class ChartModelTest(unittest.TestCase):
         sw = self.model.add_series(["M21C", "M5C"], side="left")
         self.model.add_series(["收盘价"], side="right", target_name=sw.name)
         self.model.show_days = 30
-        from src.gui.business.cache import extract_display_state
-        state = extract_display_state(self.model)
+        state = extract_display_config(self.model)
         m2 = ChartModel(self.store)
         m2.restore_state(state)
+        # 恢复显示列项和 show_days
         self.assertEqual(m2.show_days, 30)
         self.assertEqual(m2.sub_wins[0].name, "M21C-M5C-收盘价")
+
+
+class WindowConfigTest(unittest.TestCase):
+    """验证图表显示配置记录到 gui.json 的 window 字段（对所有 csv 有效）。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.config_path = Path(self._tmp.name) / "gui.json"
+        self.window_cfg = WindowConfig(self.config_path)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_save_load_roundtrip(self) -> None:
+        config = {
+            "show_days": 42,
+            "sub_wins": [
+                {"series": [{"column": "M21C", "side": "left"},
+                            {"column": "收盘价", "side": "right"}]},
+                {"series": [{"column": "NC", "side": "left"}]},
+            ],
+        }
+        self.window_cfg.save(config)
+        self.assertEqual(self.window_cfg.load(), config)
+
+    def test_preserve_other_fields(self) -> None:
+        # 先写入其他字段（模拟 tmp 等），再保存 window 不应覆盖
+        self.config_path.write_text(
+            '{"tmp": "/some/path", "window": {}}', encoding="utf-8")
+        self.window_cfg.save({
+            "sub_wins": [{"series": [{"column": "M21C", "side": "left"}]}],
+        })
+        data = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(data["tmp"], "/some/path")
+        self.assertEqual(data["window"]["sub_wins"][0]["series"][0]["column"], "M21C")
+
+    def test_extract_display_config(self) -> None:
+        # 从图表模型提取 show_days 与 sub_win 显示的列项参数（不含数据数值）
+        path = Path(self._tmp.name) / "sample.csv"
+        make_sample_csv(path)
+        store = DataStore()
+        store.load_file(path)
+        model = ChartModel(store)
+        model.add_series(["M21C", "M5C"], side="left")
+        model.add_series(["收盘价"], side="right", target_name="M21C-M5C")
+        cfg = extract_display_config(model)
+        self.assertEqual(cfg["show_days"], DEFAULT_SHOW_DAYS)
+        self.assertEqual(
+            cfg["sub_wins"][0]["series"],
+            [{"column": "M21C", "side": "left"},
+             {"column": "M5C", "side": "left"},
+             {"column": "收盘价", "side": "right"}],
+        )
+
+    def test_load_missing_returns_empty(self) -> None:
+        self.assertEqual(self.window_cfg.load(), {})
+
+    def test_load_corrupt_returns_empty(self) -> None:
+        self.config_path.write_text("{ not valid json", encoding="utf-8")
+        self.assertEqual(self.window_cfg.load(), {})
 
 
 class PreprocessHelperTest(unittest.TestCase):

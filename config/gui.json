@@ -1,3 +1,43 @@
 {
-  "tmp": "/Users/jucat/ws/lazyshare/test_output"
+  "window": {
+    "show_days": 168,
+    "sub_wins": [
+      {
+        "series": [
+          {
+            "column": "收盘价",
+            "side": "left"
+          },
+          {
+            "column": "成交量",
+            "side": "right"
+          }
+        ]
+      },
+      {
+        "series": [
+          {
+            "column": "NC",
+            "side": "left"
+          },
+          {
+            "column": "NV",
+            "side": "right"
+          }
+        ]
+      },
+      {
+        "series": [
+          {
+            "column": "NA",
+            "side": "left"
+          },
+          {
+            "column": "SNB",
+            "side": "right"
+          }
+        ]
+      }
+    ]
+  }
 }

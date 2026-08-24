@@ -45,7 +45,10 @@ def load_gui_config(config_path: Path = DEFAULT_GUI_CONFIG) -> dict:
 
 
 def get_tmp_dir(config_path: Path = DEFAULT_GUI_CONFIG) -> Path:
-    """返回 gui.json 中 tmp 缓存目录（不存在时创建；未配置则用默认目录）。"""
+    """返回 gui.json 中 tmp 目录（不存在时创建；未配置则用默认目录）。
+
+    该目录当前用于存放最近打开文件记录（RecentFiles）。
+    """
     cfg = load_gui_config(config_path)
     raw = cfg.get("tmp", "")
     if raw:

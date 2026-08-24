@@ -13,13 +13,9 @@ from PySide6.QtWidgets import (
     QSplitter,
 )
 
-from src.gui.business.cache import (
-    DisplayCache,
-    extract_display_state,
-    has_display_state,
-)
 from src.gui.business.config import get_preprocessed_dir
 from src.gui.business.recent_files import RecentFiles
+from src.gui.business.window_config import WindowConfig, extract_display_config
 from src.gui.ui.chart_win import ChartWin
 from src.gui.ui.dialogs import AddDataDialog, DeleteDataDialog
 from src.gui.ui.info_win import InfoWin
@@ -32,7 +28,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self, data_store, chart_model,
                  recent: RecentFiles | None = None,
-                 cache: DisplayCache | None = None) -> None:
+                 window_cfg: WindowConfig | None = None) -> None:
         super().__init__()
         self._store = data_store
         self._model = chart_model
@@ -43,10 +39,11 @@ class MainWindow(QMainWindow):
         self.resize(1280, 800)
 
         self._recent = recent if recent is not None else RecentFiles()
-        self._cache = cache if cache is not None else DisplayCache()
+        self._window_cfg = window_cfg if window_cfg is not None else WindowConfig()
         self._build_menu()
 
-        self._chart_win = ChartWin(chart_model, data_store)
+        self._chart_win = ChartWin(chart_model, data_store,
+                                   on_zoom=self._save_display_config)
         self._info_win = InfoWin(data_store)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -98,23 +95,18 @@ class MainWindow(QMainWindow):
         self.load_file(path)
 
     def load_file(self, path: str | Path) -> None:
-        """加载 csv 文件：打开新文件前缓存旧文件显示内容，加载后从缓存快速恢复。"""
+        """加载 csv 文件：加载后按 gui.json 的 window 配置恢复显示列项。"""
         path = Path(path)
-        # 打开新文件时，把旧文件的显示内容（sub_win / show_days 等，不含数据数值）打包缓存
-        if self._store.is_loaded and self._store.file_path:
-            old_state = extract_display_state(self._model)
-            if has_display_state(old_state):
-                self._cache.save(self._store.file_path, old_state)
         try:
             self._store.load_file(path)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "打开失败",
                                  f"无法加载文件：\n{path}\n\n{exc}")
             return
-        # 先从缓存中找记录，有就快速恢复显示；否则清空
-        cached = self._cache.load(str(path))
-        if cached is not None:
-            self._model.restore_state(cached)
+        # 从 window 配置恢复显示列项（全局配置，对所有 csv 文件有效）；无配置则清空
+        cfg = self._window_cfg.load()
+        if cfg.get("sub_wins"):
+            self._model.restore_state(cfg)
         else:
             self._model.clear()
         self.setWindowTitle(f"LazyShare - {path.name}")
@@ -161,7 +153,7 @@ class MainWindow(QMainWindow):
             side=result["side"],
             target_name=result["target_name"],
         )
-        self._save_current_cache()
+        self._save_display_config()
 
     def delete_data(self) -> None:
         if not self._model.sub_wins:
@@ -176,17 +168,11 @@ class MainWindow(QMainWindow):
             return
         for column, side in result["series"]:
             self._model.remove_series(sw, column, side)
-        self._save_current_cache()
+        self._save_display_config()
 
-    def _save_current_cache(self) -> None:
-        """编辑后更新当前文件的缓存记录（显示内容被清空则移除缓存）。"""
-        if not (self._store.is_loaded and self._store.file_path):
-            return
-        state = extract_display_state(self._model)
-        if has_display_state(state):
-            self._cache.save(self._store.file_path, state)
-        else:
-            self._cache.remove(self._store.file_path)
+    def _save_display_config(self) -> None:
+        """添加/删除数据后实时记录显示配置到 gui.json 的 window 字段。"""
+        self._window_cfg.save(extract_display_config(self._model))
 
     # ------------------------------------------------------------------
     def _on_store_changed(self) -> None:
@@ -195,3 +181,4 @@ class MainWindow(QMainWindow):
 
     def _on_model_changed(self) -> None:
         self._action_delete_data.setEnabled(bool(self._model.sub_wins))
+

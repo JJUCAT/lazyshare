@@ -7,6 +7,8 @@
 """
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -26,10 +28,12 @@ from .sub_win import SubWinWidget
 class ChartWin(QWidget):
     """左侧图表主窗口。"""
 
-    def __init__(self, model, data_store) -> None:
+    def __init__(self, model, data_store,
+                 on_zoom: Callable[[], None] | None = None) -> None:
         super().__init__()
         self._model = model
         self._data_store = data_store
+        self._on_zoom_cb = on_zoom  # 点击缩放（+/-）后的保存回调
         self._float_win = FloatWin()
         self._subwin_widgets: list[SubWinWidget] = []
         self._last_structure_key: tuple | None = None
@@ -46,11 +50,11 @@ class ChartWin(QWidget):
         self._btn_zoom_out = QToolButton()
         self._btn_zoom_out.setText("－")
         self._btn_zoom_out.setToolTip("show_days 缩小一半")
-        self._btn_zoom_out.clicked.connect(self._model.zoom_out)
+        self._btn_zoom_out.clicked.connect(self._zoom_out)
         self._btn_zoom_in = QToolButton()
         self._btn_zoom_in.setText("＋")
         self._btn_zoom_in.setToolTip("show_days 翻倍")
-        self._btn_zoom_in.clicked.connect(self._model.zoom_in)
+        self._btn_zoom_in.clicked.connect(self._zoom_in)
         header.addWidget(self._btn_zoom_out)
         header.addWidget(self._btn_zoom_in)
 
@@ -76,6 +80,19 @@ class ChartWin(QWidget):
         root.addWidget(self._hscroll)
 
         self._on_model_changed()
+
+    # ------------------------------------------------------------------
+    # 缩放（+/-）：调整 show_days 后触发保存回调
+    # ------------------------------------------------------------------
+    def _zoom_out(self) -> None:
+        self._model.zoom_out()
+        if self._on_zoom_cb is not None:
+            self._on_zoom_cb()
+
+    def _zoom_in(self) -> None:
+        self._model.zoom_in()
+        if self._on_zoom_cb is not None:
+            self._on_zoom_cb()
 
     # ------------------------------------------------------------------
     # 模型变化刷新

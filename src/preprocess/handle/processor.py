@@ -108,6 +108,7 @@ def process_file(task: tuple[Path, Path]) -> dict:
             "SNC": ind["snc"],
             "SNV": ind["snv"],
             "SNB": ind["snb"],
+            "M21SNB": ind["m21snb"],
             "峰值标签": peak_labels,
         }
     )

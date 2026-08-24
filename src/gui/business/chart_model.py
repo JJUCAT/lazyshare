@@ -211,7 +211,7 @@ class ChartModel:
         return True
 
     def restore_state(self, state: dict) -> None:
-        """按缓存显示状态恢复（不含数据数值），与 extract_display_state 对应。"""
+        """按显示配置恢复（不含数据数值），与 extract_display_config 对应。"""
         self.clear()
         self.show_days = max(1, int(state.get("show_days", DEFAULT_SHOW_DAYS)))
         for sw_data in state.get("sub_wins", []):

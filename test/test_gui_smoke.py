@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""GUI 冒烟测试（离屏渲染）：主窗口构建、加载、渲染、峰值标签、最近文件、缓存。"""
+"""GUI 冒烟测试（离屏渲染）：主窗口构建、加载、渲染、峰值标签、最近文件、窗口显示配置。"""
 from __future__ import annotations
 
 import os
@@ -17,10 +17,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
-from src.gui.business.cache import DisplayCache
 from src.gui.business.chart_model import ChartModel
 from src.gui.business.data_store import DataStore
 from src.gui.business.recent_files import RecentFiles
+from src.gui.business.window_config import WindowConfig
 from src.gui.ui.dialogs import AddDataDialog, DeleteDataDialog
 from src.gui.ui.main_window import MainWindow
 
@@ -37,19 +37,20 @@ class GuiSmokeTest(unittest.TestCase):
         self.path = Path(self._tmp.name) / "sample.csv"
         make_sample_csv(self.path, n=120)
         self._tmp_recent = tempfile.TemporaryDirectory()
-        self._tmp_cache = tempfile.TemporaryDirectory()
+        self._tmp_window = tempfile.TemporaryDirectory()
         self.store = DataStore()
         self.model = ChartModel(self.store)
         recent = RecentFiles(Path(self._tmp_recent.name))
-        cache = DisplayCache(Path(self._tmp_cache.name))
-        self.win = MainWindow(self.store, self.model, recent=recent, cache=cache)
+        window_cfg = WindowConfig(Path(self._tmp_window.name) / "gui.json")
+        self.win = MainWindow(self.store, self.model, recent=recent,
+                              window_cfg=window_cfg)
         self.win.load_file(self.path)
 
     def tearDown(self) -> None:
         self.win.close()
         self._tmp.cleanup()
         self._tmp_recent.cleanup()
-        self._tmp_cache.cleanup()
+        self._tmp_window.cleanup()
 
     def test_window_loads_and_title(self) -> None:
         self.assertTrue(self.store.is_loaded)
@@ -123,23 +124,41 @@ class GuiSmokeTest(unittest.TestCase):
                  if not a.isSeparator() and a.text() != "清空最近文件"]
         self.assertIn(self.path.name, names)
 
-    def test_cache_restore_on_reopen(self) -> None:
+    def test_display_config_saved_after_add(self) -> None:
         self.model.add_series(["M21C", "M5C"], side="left")
-        self.model.show_days = 30
+        self.win._save_display_config()
+        cfg = WindowConfig(Path(self._tmp_window.name) / "gui.json").load()
+        cols = [s["column"] for s in cfg["sub_wins"][0]["series"]]
+        self.assertEqual(cols, ["M21C", "M5C"])
+        self.assertEqual(cfg["show_days"], self.model.show_days)
+
+    def test_zoom_saves_show_days(self) -> None:
+        # 点击缩放（+）后 show_days 实时保存到 window 配置
+        self.win._chart_win._btn_zoom_in.click()
+        cfg = WindowConfig(Path(self._tmp_window.name) / "gui.json").load()
+        self.assertEqual(cfg["show_days"], self.model.show_days)
+        self.assertGreater(self.model.show_days, 21)
+
+    def test_window_config_restores_columns_on_open(self) -> None:
+        # 已有 window 显示配置时，打开 csv 文件依然显示这些列项和 show_days
+        WindowConfig(Path(self._tmp_window.name) / "gui.json").save({
+            "show_days": 30,
+            "sub_wins": [{"series": [{"column": "M21C", "side": "left"},
+                                     {"column": "收盘价", "side": "right"}]}],
+        })
         self.win.load_file(self.path)
         self.assertEqual(self.win._model.show_days, 30)
-        self.assertIn("M21C-M5C", [s.name for s in self.win._model.sub_wins])
+        self.assertEqual(self.win._model.sub_wins[0].name, "M21C-收盘价")
 
-    def test_cache_updated_after_edit(self) -> None:
-        cache = self.win._cache
+    def test_display_config_updated_after_edit(self) -> None:
         self.model.add_series(["M21C", "M5C"], side="left")
-        self.win._save_current_cache()
-        self.assertIn(str(self.path), cache.list_cached())
+        self.win._save_display_config()
         sw = self.model.get_subwin("M21C-M5C")
         self.model.remove_series(sw, "M21C")
         self.model.remove_series(sw, "M5C")
-        self.win._save_current_cache()
-        self.assertNotIn(str(self.path), cache.list_cached())
+        self.win._save_display_config()
+        cfg = WindowConfig(Path(self._tmp_window.name) / "gui.json").load()
+        self.assertEqual(cfg.get("sub_wins"), [])
 
 
 if __name__ == "__main__":
