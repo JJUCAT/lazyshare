@@ -37,6 +37,9 @@ DENSE_THRESHOLD = 400
 # 峰值标签固定大小（不受缩放影响）
 PEAK_LABEL_SIZE = 14.0
 
+# 需绘制的峰值标签：仅绘制 T（Top）/ B（Bottom），忽视 N（None）标签
+PEAK_LABELS_DRAWN = ("T", "B")
+
 
 class SubWinWidget(QWidget):
     """绑定一个 business.SubWin 的绘图控件。"""
@@ -272,9 +275,10 @@ class SubWinWidget(QWidget):
 
     def _draw_peak_labels(self, painter: QPainter, plot: QRectF,
                           offset: int, show: int) -> None:
-        """在“收盘价”曲线数据点上方绘制峰值标签（T 红 / B 绿）。
+        """在“收盘价”曲线数据点上方绘制峰值标签（T 红 / B 绿，忽视 N）。
 
-        仅当 sub_win 含有“收盘价”曲线且数据含“峰值标签”列时绘制。
+        仅当 sub_win 含有“收盘价”曲线且数据含“峰值标签”列时绘制；
+        N（None）标签不绘制。
         """
         close_series = next(
             (s for s in self.subwin.series if s.column == CLOSE_COLUMN), None)
@@ -294,7 +298,8 @@ class SubWinWidget(QWidget):
             if idx < 0 or idx >= len(labels):
                 continue
             lab = str(labels[idx]).strip()
-            if lab not in ("T", "B"):
+            if lab not in PEAK_LABELS_DRAWN:
+                # 忽视 N（None）等其他标签，不绘制
                 continue
             v = close_series.values[idx]
             if not np.isfinite(v):

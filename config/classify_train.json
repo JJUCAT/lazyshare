@@ -1,0 +1,61 @@
+{
+  "slice": {
+    "seq_len": 42,
+    "jump_step": 7,
+    "items": [
+      "NC",
+      "NV",
+      "NA",
+      "SNB"
+    ],
+    "label": [
+      "峰值标签"
+    ]
+  },
+
+  "data_source": "/Users/jucat/data/ashare/preprocessed",
+  "dataset": "/Users/jucat/data/ashare/dataset",
+  "validation": "/Users/jucat/data/ashare/validation",
+  "models": "/Users/jucat/data/ashare/models",
+
+  "train": {
+    "arch": "InceptionTimePlus",
+    "tfms": "TSClassification",
+    "batch_tfms": "TSStandardize",
+    "batch_size": 128,
+    "epochs": 30,
+    "learning_rate": 0.001,
+    "validation_set": 0.1,
+    "loss_label_weight": {
+      "T": 1.0,
+      "B": 1.0,
+      "N": 1.0
+    },
+    "test": {
+      "train_max": -1
+    }
+  },
+
+  "evaluate": {
+    "labels": [
+      "T",
+      "B"
+    ],
+
+    "items": [
+      "accuracy",
+      "precision",
+      "recall",
+      "f1_score",
+      "roc_auc"
+    ],
+
+    "accuracy_interval": [
+      0.99,
+      0.95,
+      0.90,
+      0.85,
+      0.80
+    ]
+  }
+}

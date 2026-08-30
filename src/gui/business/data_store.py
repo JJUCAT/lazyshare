@@ -10,7 +10,7 @@ import pandas as pd
 # CSV 中的标识列（不作为图表数值列）
 IDENTITY_COLUMNS = ("日期", "股票代码", "股票名称", "行业")
 
-# 峰值标签列（T/B 字符串，不作为普通数值曲线，用于收盘价上方标注）
+# 峰值标签列（T/B/N 字符串，不作为普通数值曲线，用于收盘价上方标注）
 PEAK_LABEL_COLUMN = "峰值标签"
 CLOSE_COLUMN = "收盘价"
 
@@ -99,7 +99,10 @@ class DataStore:
         return self._values.get(column, np.array([]))
 
     def get_peak_labels(self) -> np.ndarray:
-        """返回峰值标签数组（'' / 'T' / 'B'），无此列时返回空数组。"""
+        """返回峰值标签数组（'' / 'T' / 'B' / 'N'），无此列时返回空数组。
+
+        调用方（sub_win 绘制）应忽视 N（None）标签，仅绘制 T / B。
+        """
         return (self._peak_labels if self._peak_labels is not None
                 else np.array([], dtype=object))
 

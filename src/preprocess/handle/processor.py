@@ -87,7 +87,7 @@ def process_file(task: tuple[Path, Path]) -> dict:
 
     ind = compute_indicators(df)
 
-    # 峰值标签：T（高峰）/ B（低谷）/ 空（标签计算在 src/preprocess/label）
+    # 峰值标签：T（高峰）/ B（低谷）/ N（None）（标签计算在 src/preprocess/label）
     peak_labels = compute_peak_labels(ind["close"], ind["m21c"])
 
     out = pd.DataFrame(

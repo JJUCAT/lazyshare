@@ -4,7 +4,7 @@
 
 功能实现在 src/preprocess 目录：
     - src/preprocess/handle ：基础工作（配置 / 指标计算 / ST 判断 / 单文件处理 / 多进程编排）
-    - src/preprocess/label  ：标签计算（峰值标签 T / B）
+    - src/preprocess/label  ：标签计算（峰值标签 T / B / N）
 本脚本仅负责入口启动。
 
 用法：
