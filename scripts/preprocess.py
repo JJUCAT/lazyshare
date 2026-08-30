@@ -8,7 +8,12 @@
 本脚本仅负责入口启动。
 
 用法：
-    python3 scripts/preprocess.py [--config config/preprocess.json] [--limit N] [--workers N]
+    python3 scripts/preprocess.py [--config config/preprocess.json] [--limit N] [--workers N] [--update]
+
+update 接口：
+    从 raw_data 增量更新新数据到 preprocessed_data：
+    python3 scripts/preprocess.py --update
+    仅重新处理有新日期（或新增股票）的原始文件，其余文件跳过。
 """
 from __future__ import annotations
 

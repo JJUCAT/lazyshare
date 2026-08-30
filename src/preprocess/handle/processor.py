@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import logging
 import os
 import sys
@@ -60,7 +61,8 @@ def process_file(task: tuple[Path, Path]) -> dict:
     """
     raw_file, tmp_path = task
     try:
-        df = pd.read_csv(raw_file, encoding="utf-8-sig")
+        # dtype=str：保留股票代码的前导零（如 000001），避免被推断为整数
+        df = pd.read_csv(raw_file, encoding="utf-8-sig", dtype=str)
     except Exception as exc:  # noqa: BLE001
         return {"status": "error", "code": None, "name": None,
                 "message": f"读取失败: {exc}"}
@@ -76,9 +78,12 @@ def process_file(task: tuple[Path, Path]) -> dict:
         .reset_index(drop=True)
     )
 
-    code = str(df[COL_CODE].iloc[-1])
-    name = str(df[COL_NAME].iloc[-1]).strip()
-    industry = str(df[COL_INDUSTRY].iloc[-1]).strip()
+    code_raw = df[COL_CODE].iloc[-1]
+    name_raw = df[COL_NAME].iloc[-1]
+    industry_raw = df[COL_INDUSTRY].iloc[-1]
+    code = str(code_raw).strip() if not pd.isna(code_raw) else ""
+    name = str(name_raw).strip() if not pd.isna(name_raw) else ""
+    industry = str(industry_raw).strip() if not pd.isna(industry_raw) else ""
 
     # ST 股票跳过，不生成预处理数据文件
     if is_st_stock(df):
@@ -119,23 +124,73 @@ def process_file(task: tuple[Path, Path]) -> dict:
     return {"status": "ok", "code": code, "name": name, "message": None}
 
 
-def allocate_path(out_dir: Path, base: str, code: str, used: set[str]) -> Path:
-    """在 out_dir 下分配未占用的输出文件路径。
+def needs_update(raw_file: Path, out_dir: Path) -> bool:
+    """判断原始文件是否需要重新生成预处理输出（增量更新）。
 
-    优先级：{名称}.csv -> {名称}_{代码}.csv -> {名称}_{代码}_{n}.csv
+    - ST 股票不生成输出，无需更新
+    - 输出文件不存在 → 需要（新股票）
+    - 输出文件缺少原始数据中的任意日期 → 需要
+    - 输出文件已包含原始数据全部日期 → 无需
     """
-    for cand in (base, f"{base}_{code}"):
-        path = out_dir / f"{cand}.csv"
-        if str(path) not in used:
-            used.add(str(path))
-            return path
-    i = 2
-    while True:
-        path = out_dir / f"{base}_{code}_{i}.csv"
-        if str(path) not in used:
-            used.add(str(path))
-            return path
-        i += 1
+    raw_dates: set[str] = set()
+    code = name = ""
+    last_name = ""
+    last_st_flag = False
+    try:
+        with open(raw_file, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if header is None:
+                return False
+            try:
+                ci = header.index("代码")
+                ni = header.index("名称")
+                di = header.index("日期")
+            except ValueError:
+                return False
+            st_idx = header.index("是否ST") if "是否ST" in header else -1
+            for row in reader:
+                if len(row) <= max(ci, ni, di):
+                    continue
+                if not code:
+                    code = row[ci].strip()
+                    name = row[ni].strip()
+                raw_dates.add(row[di])
+                if len(row) > ni:
+                    last_name = row[ni].strip()
+                if st_idx >= 0 and len(row) > st_idx:
+                    last_st_flag = row[st_idx].strip() == "是"
+    except OSError:
+        return False
+    if not code or not raw_dates:
+        return False
+    # ST 股票不生成预处理文件，无需更新
+    if "ST" in last_name.upper() or last_st_flag:
+        return False
+
+    # 按代码匹配输出文件（名称可能变化）
+    matches = list(out_dir.glob(f"{code}-*.csv"))
+    if not matches:
+        return True
+    out_file = matches[0]
+
+    out_dates: set[str] = set()
+    try:
+        with open(out_file, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if header is None:
+                return True
+            try:
+                di = header.index("日期")
+            except ValueError:
+                return True
+            for row in reader:
+                if len(row) > di:
+                    out_dates.add(row[di])
+    except OSError:
+        return True
+    return not raw_dates.issubset(out_dates)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -148,6 +203,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--limit", type=int, default=None,
                         help="仅处理前 N 个文件（调试用）")
+    parser.add_argument("--update", action="store_true",
+                        help="增量更新：仅重新处理有新数据（新日期/新股票）的文件")
     parser.add_argument(
         "--workers", type=int, default=None,
         help="并行 worker 数量（默认取 CPU 核心数的一半）",
@@ -164,6 +221,12 @@ def main(argv: list[str] | None = None) -> int:
     raw_files = sorted(raw_dir.glob("*.csv"))
     if args.limit is not None:
         raw_files = raw_files[: args.limit]
+
+    if args.update:
+        before = len(raw_files)
+        raw_files = [f for f in raw_files if needs_update(f, out_dir)]
+        logging.info("update 模式：共 %d 个原始文件，%d 个需要更新",
+                     before, len(raw_files))
 
     n_workers = args.workers if args.workers else max(1, (os.cpu_count() or 1) // 2)
     start_time = time.perf_counter()
@@ -185,15 +248,10 @@ def main(argv: list[str] | None = None) -> int:
         for i, raw_file in enumerate(raw_files)
     ]
 
-    # 输出文件名分配：默认使用股票名称，重名时追加股票代码（按输入顺序确定性分配）
-    seen_names: dict[str, str] = {}   # 清洗后的名称 -> 已分配股票代码
-    used_paths: set[str] = set()
-
     processed = 0
     skipped = 0
-    collisions = 0
     with ProcessPoolExecutor(max_workers=n_workers) as executor:
-        # map 保持输入顺序，保证重名分配结果确定
+        # map 保持输入顺序
         for i, result in enumerate(executor.map(process_file, tasks, chunksize=1)):
             tmp_path: Path = tasks[i][1]
             raw_file: Path = tasks[i][0]
@@ -207,23 +265,19 @@ def main(argv: list[str] | None = None) -> int:
 
             code = result["code"]
             name = result["name"]
-            base = sanitize_filename(name)
-            if base in seen_names:
-                collisions += 1
-                logging.warning(
-                    "股票名称重复: %s（%s 与 %s），输出文件追加代码区分",
-                    name, seen_names[base], raw_file.name,
-                )
-            seen_names[base] = code
-
-            final_path = allocate_path(out_dir, base, code, used_paths)
+            # 输出文件名：股票代码-股票名称（股票代码唯一，见 preprocess_plan.md）
+            final_path = out_dir / f"{code}-{sanitize_filename(name)}.csv"
             tmp_path.rename(final_path)
+            # 清理同名代码的旧输出文件（名称变更时避免残留）
+            for old in out_dir.glob(f"{code}-*.csv"):
+                if old != final_path:
+                    old.unlink(missing_ok=True)
             processed += 1
             if processed % 500 == 0:
                 logging.info("已处理 %d 个文件...", processed)
 
     elapsed = time.perf_counter() - start_time
-    logging.info("完成：预处理文件数量 %d 个，跳过 %d 个，重名追加 %d 个，耗时 %.2f 秒",
-                 processed, skipped, collisions, elapsed)
+    logging.info("完成：预处理文件数量 %d 个，跳过 %d 个，耗时 %.2f 秒",
+                 processed, skipped, elapsed)
     logging.info("输出目录: %s", out_dir)
     return 0

@@ -9,7 +9,7 @@ preprocess 实现：
 使用一半 cpu 核心数量多线程加速处理
 浮点数小数点最多保留 3 位数
 日志保存到 test_output，记录预处理文件数量，耗时
-preprocess.py 数据预处理，得到 csv 文件，文件名为股票名称
+preprocess.py 数据预处理，得到 csv 文件，文件名为“股票代码-股票名称”
 st 的股票跳过，不生成预处理数据文件
 
 列项有：{
@@ -40,5 +40,9 @@ B：Bottom 表示收盘价在一段时间内是低谷值。
   从 pb_day 开始往前找 k 天（包括 pb_day 当天），收盘价最低那天是 cb_day。
   cb_day 前后 k 天都是最低值的话，cb_day 及其后 4 天都标记为 B，共 5 天。
 N：除了 T 和 B 之外的都是 None。
+
+实现 update 接口：
+从 "raw_data" 更新新数据到 "preprocessed_data" 路径
+scripts/preprocess.py 增加输入参数接口 "update" 支持更新数据
 
 
