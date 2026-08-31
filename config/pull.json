@@ -1,0 +1,20 @@
+{
+  "source": {
+    "dyy": {
+      "url": "www.dyyboard.ltd",
+      "account": "im25547",
+      "password": "u86hqc3F"
+    }
+  },
+
+  "spider": {
+    "share_individual": {
+      "port": "日常更新",
+      "type": "前复权",
+      "frequency": 1
+    }
+  },
+
+  "share": "/Users/jucat/data/ashare/share",
+  "download": "/Users/jucat/data/ashare/update"
+}

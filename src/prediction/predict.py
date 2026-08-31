@@ -35,6 +35,8 @@ from src.train.data import DATE_COL, DEFAULT_CONFIG, load_config
 
 CODE_COL = "股票代码"
 NAME_COL = "股票名称"
+# 最新数据早于全局最新交易日 N 天以上，视为已退市 / 长期停牌，予以剔除
+STALE_DAYS = 30
 
 
 def load_learner(model_path: Path):
@@ -103,6 +105,12 @@ def make_latest_window(raw_file: Path, items: list[str], seq_len: int,
     return out_path, end_date
 
 
+def is_delisted_or_st(name: str) -> bool:
+    """按股票名称判断是否退市或 ST 股（名称含"退"或"ST"，如 退市苏吴 / *ST 某某）。"""
+    name = (name or "").strip()
+    return "退" in name or "ST" in name.upper()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="股票分类预测（用最新模型预测每只股票最新一天标签）")
@@ -120,6 +128,15 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    # 快速检查 tsai 环境，避免切片后才报错（推理依赖 tsai，需在 tsai conda 环境运行）
+    try:
+        from tsai.inference import load_learner  # noqa: F401
+    except ModuleNotFoundError:
+        logging.error(
+            "未找到 tsai.inference：请在 tsai conda 环境运行（bash scripts/prediction.sh），"
+            "或先执行 conda activate tsai 再运行 scripts/prediction.py")
+        return 1
 
     cfg = load_config(args.config)
     date_str = args.date or datetime.now().strftime("%Y%m%d")
@@ -178,7 +195,7 @@ def main(argv: list[str] | None = None) -> int:
     scored = probas * w[None, :]
     pred_idx = np.argmax(scored, axis=-1)
 
-    # 汇总结果：只看 T / B，按置信度降序
+    # 汇总结果：只看 T / B，剔除退市 / ST 股，按置信度降序
     rows: list[dict] = []
     for (stem, code, name, date), p, pi in zip(metas, probas, pred_idx):
         rows.append({
@@ -186,8 +203,39 @@ def main(argv: list[str] | None = None) -> int:
             "pred": classes[int(pi)], "conf": float(p[int(pi)]),
             "date": date, "stem": stem,
         })
-    tb = [r for r in rows if r["pred"] in ("T", "B")]
+    def _parse_date(s: str):
+        try:
+            return datetime.strptime(str(s).strip(), "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            return None
+
+    # 全局最新交易日（用于识别数据已停止更新的退市/长期停牌股）
+    parsed_dates: list = []
+    for _m in metas:
+        _d = _parse_date(_m[3])
+        if _d is not None:
+            parsed_dates.append(_d)
+    global_latest = max(parsed_dates) if parsed_dates else None
+
+    # 只看 T / B，剔除退市 / ST（名称）与停更（最新数据早于全局最新 30 天以上）股票
+    tb_all = [r for r in rows if r["pred"] in ("T", "B")]
+    removed_name = 0
+    removed_stale = 0
+    tb = []
+    for r in tb_all:
+        if is_delisted_or_st(r["name"]):
+            removed_name += 1
+            continue
+        d = _parse_date(r["date"])
+        if d is not None and global_latest is not None \
+                and (global_latest - d).days > STALE_DAYS:
+            removed_stale += 1
+            continue
+        tb.append(r)
     tb.sort(key=lambda r: r["conf"], reverse=True)
+    removed = len(tb_all) - len(tb)
+    removed_desc = (f"剔除退市/ST {removed_name} 条，停更 {removed_stale} 条"
+                    if removed_stale else f"剔除退市/ST {removed_name} 条")
 
     # 写 prediction.log
     log_path = out_root / "prediction.log"
@@ -197,16 +245,17 @@ def main(argv: list[str] | None = None) -> int:
         f"数据源: {cfg['data_source']}",
         f"窗口长度(seq_len): {seq_len}",
         f"预测交易日: {rows[0]['date'] if rows else '-'}",
-        f"股票总数: {len(rows)}，T/B 命中: {len(tb)}",
+        f"股票总数: {len(rows)}，T/B 命中: {len(tb_all)}（{removed_desc}）",
         "",
-        "分类结果（仅 T / B，按置信度从高到低）:",
+        "分类结果（仅 T / B，剔除退市/ST/停更，按置信度从高到低）:",
         f"{'排名':<6}{'股票代码':<10}{'股票名称':<16}{'预测':<6}{'置信度':<10}{'交易日'}",
     ]
     for i, r in enumerate(tb, 1):
         lines.append(f"{i:<6}{r['code']:<10}{r['name']:<16}{r['pred']:<6}"
                      f"{r['conf']:.4f}    {r['date']}")
     log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    logging.info("分类结果已保存: %s（T/B %d 条）", log_path, len(tb))
+    logging.info("分类结果已保存: %s（T/B %d 条，剔除退市/ST %d 条）",
+                 log_path, len(tb), removed)
     logging.info("dataset 目录: %s", dataset_dir)
     return 0
 
