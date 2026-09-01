@@ -1,0 +1,10 @@
+{
+  "smtp": {
+    "server": "smtp.163.com",
+    "auth_code": "TPxxv6LcCqUe43R2"
+  },
+
+  "mails": [
+    "lmr2887@163.com"
+  ]
+}

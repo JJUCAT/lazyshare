@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""一键运行：拉取 → 更新 → 预处理 → 预测（尽量调用现有功能接口）。
+"""一键运行：拉取 → 更新 → 预处理 → 预测 → 邮件（尽量调用现有功能接口）。
 
 流程（见 run_plan.md）：
     1. pull      : 使用 pull.json 拉取最新数据
     2. update    : 使用 update.json 更新个股历史数据
     3. preprocess: 使用 preprocess.json 更新预处理数据
     4. prediction: 使用 prediction.sh 估计最新股票标签
+    5. mail      : 把置信度 > 阈值的股票及标签发邮件到目标邮箱（config/mail.json）
 
 本脚本只做编排：通过 subprocess 调用现有入口，不重复实现内部逻辑。
-    - pull / update / preprocess 使用系统 python3（可用 --python 指定）
+    - pull / update / preprocess / mail 使用系统 python3（可用 --python 指定）
     - prediction 使用 scripts/prediction.sh，自动激活 tsai conda 环境
 
 用法：
@@ -33,15 +34,17 @@ DEFAULT_PULL_CONFIG = PROJECT_ROOT / "config" / "pull.json"
 DEFAULT_UPDATE_CONFIG = PROJECT_ROOT / "config" / "update.json"
 DEFAULT_PREPROCESS_CONFIG = PROJECT_ROOT / "config" / "preprocess.json"
 DEFAULT_PREDICT_CONFIG = PROJECT_ROOT / "config" / "classify_train.json"
+DEFAULT_MAIL_CONFIG = PROJECT_ROOT / "config" / "mail.json"
 
 # 固定执行顺序
-STEPS = ("pull", "update", "preprocess", "predict")
+STEPS = ("pull", "update", "preprocess", "predict", "mail")
 
 STEP_DESCRIPTION = {
     "pull": "拉取最新数据（src.pull.pull）",
     "update": "更新个股历史数据（scripts/update.py）",
     "preprocess": "更新预处理数据（scripts/preprocess.py --update）",
     "predict": "估计最新股票标签（scripts/prediction.sh）",
+    "mail": "发送高置信度预测信号邮件（scripts/mail.py）",
 }
 
 
@@ -70,12 +73,16 @@ def build_commands(python: str, args: argparse.Namespace) -> dict[str, list[str]
             "bash", str(SCRIPTS_DIR / "prediction.sh"),
             "--config", str(args.predict_config), *v,
         ],
+        "mail": [
+            python, str(SCRIPTS_DIR / "mail.py"),
+            "--config", str(args.mail_config), *v,
+        ],
     }
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="一键运行：拉取 → 更新 → 预处理 → 预测（调用现有功能接口）")
+        description="一键运行：拉取 → 更新 → 预处理 → 预测 → 邮件（调用现有功能接口）")
     parser.add_argument("--pull-config", type=Path, default=DEFAULT_PULL_CONFIG,
                         help=f"pull 配置文件（默认: {DEFAULT_PULL_CONFIG}）")
     parser.add_argument("--update-config", type=Path, default=DEFAULT_UPDATE_CONFIG,
@@ -84,6 +91,8 @@ def main(argv: list[str] | None = None) -> int:
                         help=f"preprocess 配置文件（默认: {DEFAULT_PREPROCESS_CONFIG}）")
     parser.add_argument("--predict-config", type=Path, default=DEFAULT_PREDICT_CONFIG,
                         help=f"prediction 配置文件（默认: {DEFAULT_PREDICT_CONFIG}）")
+    parser.add_argument("--mail-config", type=Path, default=DEFAULT_MAIL_CONFIG,
+                        help=f"mail 配置文件（默认: {DEFAULT_MAIL_CONFIG}）")
     parser.add_argument(
         "--steps", default=",".join(STEPS),
         help=f"逗号分隔要执行的步骤（默认全部）: {', '.join(STEPS)}")
