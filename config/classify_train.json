@@ -1,7 +1,7 @@
 {
   "slice": {
-    "seq_len": 42,
-    "jump_step": 7,
+    "seq_len": 21,
+    "jump_step": 21,
     "items": [
       "NC",
       "NV",
@@ -10,7 +10,8 @@
     ],
     "label": [
       "峰值标签"
-    ]
+    ],
+    "throw_last_one": true
   },
 
   "data_source": "/Users/jucat/data/ashare/preprocessed",

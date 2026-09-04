@@ -20,8 +20,8 @@ PEAK_WINDOW = 21  # 峰值标签滑动窗口 k
 #   T 从 ct_day 起向前标记 T_MARK_DAYS_BEFORE 天（含 ct_day 共 T_MARK_DAYS_BEFORE + 1 天）
 #   B 从 cb_day 起向后标记 B_MARK_DAYS_AFTER 天（含 cb_day 共 B_MARK_DAYS_AFTER + 1 天）
 # 例如 4：T / B 均标记 5 天。
-T_MARK_DAYS_BEFORE = 4
-B_MARK_DAYS_AFTER = 4
+T_MARK_DAYS_BEFORE = 2
+B_MARK_DAYS_AFTER = 2
 
 
 def is_local_peak(arr, idx: int, k: int) -> bool:
