@@ -6,7 +6,9 @@
       "NC",
       "NV",
       "NA",
-      "SNB"
+      "SNB",
+      "IMV",
+      "SIV"
     ],
     "label": [
       "峰值标签"

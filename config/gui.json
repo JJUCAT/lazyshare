@@ -1,6 +1,6 @@
 {
   "window": {
-    "show_days": 84,
+    "show_days": 336,
     "sub_wins": [
       {
         "series": [
@@ -35,6 +35,18 @@
           {
             "column": "SNB",
             "side": "right"
+          }
+        ]
+      },
+      {
+        "series": [
+          {
+            "column": "IMV",
+            "side": "left"
+          },
+          {
+            "column": "SIV",
+            "side": "left"
           }
         ]
       }

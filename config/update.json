@@ -1,4 +1,5 @@
 {
   "update": "/Users/jucat/data/ashare/update",
-  "share": "/Users/jucat/data/ashare/share"
+  "share": "/Users/jucat/data/ashare/share",
+  "weather": "/Users/jucat/data/ashare/share/weather.csv"
 }

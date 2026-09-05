@@ -4,6 +4,7 @@ preprocess 实现：
 3.config/preprocess.json 配置文件：
   "raw_data"：原始数据路径
   "preprocessed_data"：预处理数据路径
+  "weather"：行业成交量，大盘成交量
 4.scripts/preprocess.py：启动预处理
 
 使用一半 cpu 核心数量多线程加速处理
@@ -27,6 +28,8 @@ st 的股票跳过，不生成预处理数据文件
   NBear：(最高价-收盘价)/收盘价，归一化值。表示看空。
   NBull：(收盘价-最低价)/收盘价，归一化值。表示看多。
   SNB：(NBull-NBear)累计值，归一化值。表示看多。
+  IMV：行业成交量 / 大盘成交量。表示行业热度。
+  SIV：个股成交量 / 行业成交量。表示个股在行业热度。
   峰值标签：T，B，N
 }
 

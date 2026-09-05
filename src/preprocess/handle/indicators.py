@@ -38,6 +38,8 @@ OUTPUT_COLUMNS = [
     "SNV",
     "SNB",
     "M21SNB",
+    "IMV",
+    "SIV",
     "峰值标签",
 ]
 
@@ -56,6 +58,8 @@ FLOAT_COLUMNS = [
     "SNV",
     "SNB",
     "M21SNB",
+    "IMV",
+    "SIV",
 ]
 
 # 文件名中不允许的字符（替换为下划线）

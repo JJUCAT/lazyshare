@@ -11,7 +11,7 @@ DEFAULT_CONFIG = PROJECT_ROOT / "config" / "preprocess.json"
 
 
 def load_config(config_path: Path = DEFAULT_CONFIG) -> dict:
-    """返回 {"raw_dir", "out_dir"}，路径不存在时抛异常。"""
+    """返回 {"raw_dir", "out_dir", "weather"}，路径不存在时抛异常。"""
     config_path = Path(config_path)
     if not config_path.exists():
         raise FileNotFoundError(f"配置文件不存在: {config_path}")
@@ -23,4 +23,6 @@ def load_config(config_path: Path = DEFAULT_CONFIG) -> dict:
         raise FileNotFoundError(f"原始数据目录不存在: {raw_dir}")
     if not out_dir:
         raise ValueError("preprocessed_data 未配置")
-    return {"raw_dir": raw_dir, "out_dir": out_dir}
+    weather_cfg = cfg.get("weather", "")
+    weather_path = Path(weather_cfg).expanduser() if weather_cfg else None
+    return {"raw_dir": raw_dir, "out_dir": out_dir, "weather": weather_path}

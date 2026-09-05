@@ -1,5 +1,6 @@
 {
   "raw_data": "/Users/jucat/data/ashare/share",
   "preprocessed_data": "/Users/jucat/data/ashare/preprocessed",
-  "tasks": "/Users/jucat/data/ashare/preprocessed/tasks"
+  "tasks": "/Users/jucat/data/ashare/preprocessed/tasks",
+  "weather": "/Users/jucat/data/ashare/share/weather.csv"
 }

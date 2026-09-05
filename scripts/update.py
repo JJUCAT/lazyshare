@@ -10,6 +10,8 @@
 1. 股票代码是股票的唯一标识，股票名称不是。
 2. 遍历 share 下的股票，从 update 中获取该代码的新数据并追加（按日期去重）。
 3. 检查 update 中是否有新股票，有则创建对应文件写入 share。
+4. share 股票全部更新完成后，从 share 重建 weather.csv（宽表：行=日期，列=大盘+各行业成交量，单位：万股）。
+   weather 数据来源自 share（更新后的全部股票文件），而非 update。
 
 用法:
     python3 scripts/update.py [--config config/update.json] [--dry-run]
@@ -34,9 +36,11 @@ _DAY_FILE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})_")
 # 现有 share 文件名: 代码_xxx.csv 或 代码-名称.csv
 _SHARE_FILE_RE = re.compile(r"^(\d{6})(?:_|-)")
 
+# weather.csv 由 update_weather() 按宽表重建（行=日期，列=大盘+各行业，单位：万股）
 
-def load_config(config_path: str | Path = DEFAULT_CONFIG) -> tuple[Path, Path]:
-    """返回 (update_dir, share_dir)。"""
+
+def load_config(config_path: str | Path = DEFAULT_CONFIG) -> tuple[Path, Path, Path]:
+    """返回 (update_dir, share_dir, weather_path)。weather_path 缺省为 share/weather.csv。"""
     config_path = Path(config_path)
     if not config_path.exists():
         raise FileNotFoundError(f"配置文件不存在: {config_path}")
@@ -48,7 +52,9 @@ def load_config(config_path: str | Path = DEFAULT_CONFIG) -> tuple[Path, Path]:
         raise FileNotFoundError(f"update 目录不存在: {update_dir}")
     if not share_dir.exists():
         raise FileNotFoundError(f"share 目录不存在: {share_dir}")
-    return update_dir, share_dir
+    weather_cfg = cfg.get("weather", "")
+    weather_path = Path(weather_cfg).expanduser() if weather_cfg else share_dir / "weather.csv"
+    return update_dir, share_dir, weather_path
 
 
 def sanitize_name(name: str) -> str:
@@ -96,17 +102,87 @@ def align_row(row: list[str], row_header: list[str], target_header: list[str], f
     return out
 
 
+def update_weather(share_dir: Path, weather_path: Path, dry_run: bool = False) -> int:
+    """在 share 股票全部更新后，从 share 重建 weather.csv（宽表）。
+
+    weather 数据来源自 share：遍历全部股票文件（代码-名称.csv / 代码_xxx.csv，
+    跳过 weather.csv 等非股票文件），对每行按 日期 汇总：
+        - 行业成交量：按 "所属行业" 对 "成交量（股）" 求和
+        - 大盘成交量：当天全部股票 "成交量（股）" 求和
+    行=日期，列=大盘+各行业，单位：万股（成交量（股）/10000），保留 3 位小数。
+    返回覆盖的天数。
+    """
+    per_day: dict[str, dict[str, float]] = {}   # date -> {行业: 成交量(股)}
+    total_of: dict[str, float] = {}             # date -> 全市场成交量(股)
+    skipped = 0
+    for fn in os.listdir(share_dir):
+        if not fn.endswith(".csv"):
+            continue
+        if not _SHARE_FILE_RE.match(fn):
+            continue  # 跳过 weather.csv 等非股票文件
+        header, rows = read_csv(share_dir / fn)
+        if header is None:
+            skipped += 1
+            continue
+        try:
+            di = header.index("日期")
+            ii = header.index("所属行业")
+            vi = header.index("成交量（股）")
+        except ValueError:
+            skipped += 1
+            continue
+        for row in rows:
+            if len(row) <= max(di, ii, vi):
+                continue
+            try:
+                vol = float(row[vi])
+            except ValueError:
+                continue
+            date = row[di].strip()
+            ind = row[ii].strip()
+            if not date or not ind:
+                continue
+            day = per_day.setdefault(date, {})
+            day[ind] = day.get(ind, 0.0) + vol
+            total_of[date] = total_of.get(date, 0.0) + vol
+
+    if not per_day:
+        print(f"      {weather_path.name}: share 无有效数据，未写入")
+        return 0
+
+    industries = set()
+    for day in per_day.values():
+        industries.update(day)
+    # 列：日期 + 大盘 + 各行业（缺失行业补 0）
+    data_cols = ["大盘"] + sorted(industries)
+    header = ["日期"] + data_cols
+    dates = sorted(per_day)
+    out_rows: list[list[str]] = []
+    for date in dates:
+        day = per_day[date]
+        vals = [total_of[date]] + [day.get(ind, 0.0) for ind in data_cols[1:]]
+        out_rows.append([date] + [f"{v / 10000.0:.3f}" for v in vals])
+
+    print(f"      {weather_path.name}: {len(out_rows)} 天，"
+          f"列 {len(data_cols)}（大盘 + {len(industries)} 个行业）")
+    print(f"        覆盖 {dates[0]} ~ {dates[-1]}，跳过 {skipped} 个文件")
+    if not dry_run:
+        weather_path.parent.mkdir(parents=True, exist_ok=True)
+        write_csv(weather_path, header, out_rows)
+    return len(out_rows)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="更新 share 目录下的股票数据")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="配置文件路径")
     parser.add_argument("--dry-run", action="store_true", help="仅打印将要执行的操作，不修改文件")
     args = parser.parse_args(argv)
 
-    update_dir, share_dir = load_config(args.config)
+    update_dir, share_dir, weather_path = load_config(args.config)
 
     # ---- 1. 收集 update 所有日文件，建立 code -> {date: row} ----
     day_files = iter_day_files(update_dir)
-    print(f"[1/3] 扫描 update 日文件: {len(day_files)} 个")
+    print(f"[1/4] 扫描 update 日文件: {len(day_files)} 个")
 
     upd_header: list[str] | None = None
     upd_rows: dict[str, dict[str, list[str]]] = {}
@@ -138,7 +214,7 @@ def main(argv: list[str] | None = None) -> int:
         if m and fn.endswith(".csv"):
             share_files[m.group(1)] = share_dir / fn
 
-    print(f"[2/3] share 现有股票文件: {len(share_files)} 个")
+    print(f"[2/4] share 现有股票文件: {len(share_files)} 个")
 
     # share 标准表头：取任一现有 share 文件；若无则以 update 表头 + "是否融资融券"
     std_header: list[str] | None = None
@@ -230,12 +306,17 @@ def main(argv: list[str] | None = None) -> int:
         total_appended += len(to_append)
 
     # ---- 汇总 ----
-    print(f"[3/3] 完成")
+    print(f"[3/4] 完成")
     print(f"      更新已有股票: {len(updated_codes)} 个，追加 {total_appended} 行")
     print(f"      新增股票    : {len(new_codes)} 个")
     print(f"      跳过        : {skipped} 个")
     for c in new_codes:
         print(f"        新股票: {c}")
+
+    # ---- 4. share 股票全部更新完成后，再检查更新 weather 文件（数据来源：share）----
+    print(f"[4/4] weather")
+    update_weather(share_dir, weather_path, dry_run=args.dry_run)
+
     if args.dry_run:
         print("      (dry-run，未写入任何文件)")
     return 0

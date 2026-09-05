@@ -6,6 +6,7 @@ import argparse
 import csv
 import logging
 import os
+import re
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -16,19 +17,37 @@ import pandas as pd
 from ..label.peak import compute_peak_labels
 from .config import DEFAULT_CONFIG, PROJECT_ROOT, load_config
 from .indicators import (
+    COL_CLOSE,
     COL_CODE,
     COL_DATE,
+    COL_HIGH,
     COL_INDUSTRY,
+    COL_LOW,
     COL_NAME,
+    COL_VOLUME,
     FLOAT_COLUMNS,
     OUTPUT_COLUMNS,
     compute_indicators,
     is_st_stock,
     sanitize_filename,
 )
+from .weather import EMPTY_WEATHER, compute_imv_siv, load_weather
 
 # 日志文件（工作区 test_output 目录）
 LOG_FILE = PROJECT_ROOT / "test_output" / "preprocess.log"
+
+# 原始股票数据文件名：代码-名称.csv（或旧格式 代码_名称.csv）。
+# 用于排除 weather.csv 等非股票文件（见 raw 目录内的 weather.csv）。
+_STOCK_FILE_RE = re.compile(r"^\d{6}[-_]")
+
+# weather.csv 查询表（由进程池 worker 经 initializer 加载一次，供 IMV/SIV 计算）
+_WEATHER: dict | None = None
+
+
+def _init_worker(weather_path: str | None) -> None:
+    """进程池 worker 初始化：加载 weather.csv 查询表。"""
+    global _WEATHER
+    _WEATHER = load_weather(weather_path) if weather_path else None
 
 
 def setup_logging(log_file: Path = LOG_FILE, verbose: bool = False) -> None:
@@ -70,6 +89,14 @@ def process_file(task: tuple[Path, Path]) -> dict:
         return {"status": "empty", "code": None, "name": None,
                 "message": "空文件"}
 
+    # 必要列校验（防止 weather.csv 等非股票文件导致任务整体崩溃）
+    _REQUIRED_COLS = (COL_DATE, COL_CODE, COL_NAME, COL_INDUSTRY,
+                      COL_CLOSE, COL_HIGH, COL_LOW, COL_VOLUME)
+    missing = [c for c in _REQUIRED_COLS if c not in df.columns]
+    if missing:
+        return {"status": "error", "code": None, "name": None,
+                "message": f"缺少必要列: {missing}"}
+
     # 按日期升序排序（先解析日期，避免字符串排序异常）
     df = df.assign(_dt=pd.to_datetime(df[COL_DATE], errors="coerce"))
     df = (
@@ -91,6 +118,9 @@ def process_file(task: tuple[Path, Path]) -> dict:
                 "message": "ST 股票"}
 
     ind = compute_indicators(df)
+
+    # IMV：行业成交量 / 大盘成交量；SIV：个股成交量 / 行业成交量（基于 weather.csv）
+    imv, siv = compute_imv_siv(df, _WEATHER if _WEATHER is not None else EMPTY_WEATHER)
 
     # 峰值标签：T（高峰）/ B（低谷）/ N（None）（标签计算在 src/preprocess/label）
     peak_labels = compute_peak_labels(ind["close"], ind["m21c"])
@@ -114,6 +144,8 @@ def process_file(task: tuple[Path, Path]) -> dict:
             "SNV": ind["snv"],
             "SNB": ind["snb"],
             "M21SNB": ind["m21snb"],
+            "IMV": imv,
+            "SIV": siv,
             "峰值标签": peak_labels,
         }
     )
@@ -185,6 +217,9 @@ def needs_update(raw_file: Path, out_dir: Path) -> bool:
                 di = header.index("日期")
             except ValueError:
                 return True
+            # 旧输出缺少 IMV/SIV 列时也需重新生成（列结构升级）
+            if "IMV" not in header or "SIV" not in header:
+                return True
             for row in reader:
                 if len(row) > di:
                     out_dates.add(row[di])
@@ -217,8 +252,11 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_config(args.config)
     raw_dir: Path = cfg["raw_dir"]
     out_dir: Path = cfg["out_dir"]
+    weather_path: Path | None = cfg["weather"]
 
     raw_files = sorted(raw_dir.glob("*.csv"))
+    # 仅处理股票数据文件（代码-名称.csv），排除 weather.csv 等非股票文件
+    raw_files = [f for f in raw_files if _STOCK_FILE_RE.match(f.name)]
     if args.limit is not None:
         raw_files = raw_files[: args.limit]
 
@@ -233,6 +271,10 @@ def main(argv: list[str] | None = None) -> int:
     logging.info("原始数据目录: %s（共 %d 个文件）", raw_dir, len(raw_files))
     logging.info("输出目录: %s", out_dir)
     logging.info("日志文件: %s", LOG_FILE)
+    if weather_path is not None and weather_path.exists():
+        logging.info("weather.csv: %s（IMV/SIV 数据来源）", weather_path)
+    else:
+        logging.warning("weather.csv 不存在，IMV/SIV 列将为空白: %s", weather_path)
     logging.info("并行 worker 数量: %d（CPU 核心数: %s）",
                  n_workers, os.cpu_count())
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -250,7 +292,14 @@ def main(argv: list[str] | None = None) -> int:
 
     processed = 0
     skipped = 0
-    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+    weather_arg = (
+        str(weather_path)
+        if weather_path is not None and weather_path.exists()
+        else None
+    )
+    with ProcessPoolExecutor(
+        max_workers=n_workers, initializer=_init_worker, initargs=(weather_arg,)
+    ) as executor:
         # map 保持输入顺序
         for i, result in enumerate(executor.map(process_file, tasks, chunksize=1)):
             tmp_path: Path = tasks[i][1]
