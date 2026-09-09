@@ -19,9 +19,32 @@ ENV_NAME="tsai"
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PREDICT_PY="${PROJECT_ROOT}/scripts/prediction.py"
 
-# 检查 conda 是否可用
+# conda.sh 候选路径：launchd / cron 等环境不加载 shell profile，PATH 不含 conda，
+# 无法通过 `command -v conda` 找到，故用固定路径兜底 source（对终端/launchd/cron 均生效）
+CONDA_SH_CANDIDATES=(
+    "${CONDA_EXE:+$(dirname "$(dirname "${CONDA_EXE}")")/etc/profile.d/conda.sh}"
+    "/opt/homebrew/Caskroom/miniforge/base/etc/profile.d/conda.sh"
+    "${HOME}/miniconda3/etc/profile.d/conda.sh"
+    "${HOME}/anaconda3/etc/profile.d/conda.sh"
+    "${HOME}/miniforge3/etc/profile.d/conda.sh"
+    "${HOME}/opt/miniconda3/etc/profile.d/conda.sh"
+)
+
+# 若 conda 不在 PATH，则尝试 source 候选 conda.sh（定义 conda 函数）
+if ! command -v conda >/dev/null 2>&1; then
+    for f in "${CONDA_SH_CANDIDATES[@]}"; do
+        if [[ -n "${f}" && -f "${f}" ]]; then
+            # shellcheck source=/dev/null
+            source "${f}"
+            break
+        fi
+    done
+fi
+
+# source 后仍不可用则报错退出
 if ! command -v conda >/dev/null 2>&1; then
     echo "[ERROR] 未找到 conda，请先安装 Miniconda 或 Anaconda。" >&2
+    echo "        已尝试 source: ${CONDA_SH_CANDIDATES[*]}" >&2
     exit 1
 fi
 

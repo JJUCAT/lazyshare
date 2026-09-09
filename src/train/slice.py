@@ -21,6 +21,11 @@
        - true（默认）：丢弃，只保留正向平铺的窗口；
        - false：补生成该完整窗口（起点 len-seq_len，与前面平铺窗口尾部重叠），
          使训练样本覆盖"预测最新一天"的情形。
+    6. 收益滤波器（income_filter）：对每个窗口样本，若窗口内不存在任意一个
+       "B 标签在前、T 标签在后"的组合，满足
+       - B 日到 T 日相差 <= income_filter.time 个时间节点，
+       - 收盘价从 B 日到 T 日涨幅 >= income_filter.increase，
+       则该窗口样本被删除。收盘价只用于切片时判定，不写入窗口 csv。
 
 用法：
     python3 scripts/tsai/slice.py [--config config/classify_train.json] [--limit N] [--workers N]
@@ -34,6 +39,7 @@ import sys
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -41,6 +47,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 DATE_COL = "日期"
+CLOSE_COL = "收盘价"  # 收益滤波器需要源数据中的收盘价
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "classify_train.json"
 
 
@@ -64,6 +71,19 @@ def load_train_config(config_path: Path) -> dict:
     jump_step = int(slice_cfg.get("jump_step", 21))
     # 是否丢弃"以最新一天收尾的对齐窗口"（见 tsai_classify_train_plan.md），默认 true
     throw_last_one = bool(slice_cfg.get("throw_last_one", True))
+    # 收益滤波器（见 tsai_classify_train_plan.md 规则 7）：
+    #   窗口内不存在任意一个"B 标签在前、T 标签在后"且满足
+    #   a. 相差 <= income_filter.time 天、b. 涨幅 >= income_filter.increase
+    #   的组合时，删除该窗口样本。未配置或 time<=0 时不启用。
+    income_filter = None
+    income_cfg = slice_cfg.get("income_filter")
+    if income_cfg:
+        income_time = int(income_cfg.get("time", 0))
+        if income_time > 0:
+            income_filter = {
+                "time": income_time,
+                "increase": float(income_cfg.get("increase", 0.0)),
+            }
     # items / label 已整合进 slice；兼容旧格式（顶层 items / label）
     items = slice_cfg.get("items") or cfg.get("items") or []
     label = (slice_cfg.get("label") or cfg.get("label") or ["峰值标签"])[0]
@@ -82,6 +102,7 @@ def load_train_config(config_path: Path) -> dict:
         "seq_len": seq_len,
         "jump_step": jump_step,
         "throw_last_one": throw_last_one,
+        "income_filter": income_filter,
     }
 
 
@@ -91,8 +112,9 @@ SIGNATURE_FILE = ".slice_signature.json"
 def dataset_signature(cfg: dict) -> dict:
     """由切片参数生成格式指纹，用于判断本地 dataset 与 config 是否匹配。
 
-    只要 seq_len / jump_step / 特征列 / 标签列 / throw_last_one 任一变化，
-    旧切片文件（行数、列、末尾窗口策略）即失效，需要整体重建。
+    只要 seq_len / jump_step / 特征列 / 标签列 / throw_last_one / income_filter
+    任一变化，旧切片文件（行数、列、末尾窗口策略、收益过滤结果）即失效，
+    需要整体重建。
     """
     return {
         "seq_len": cfg["seq_len"],
@@ -100,6 +122,7 @@ def dataset_signature(cfg: dict) -> dict:
         "items": [c for c in cfg["items"] if c != DATE_COL],
         "label": cfg["label"],
         "throw_last_one": cfg["throw_last_one"],
+        "income_filter": cfg["income_filter"],
     }
 
 
@@ -163,6 +186,44 @@ def ensure_dataset_consistent(dataset_dir: Path, cfg: dict) -> None:
                     sig, cur, removed)
 
 
+def window_passes_income_filter(win_df: pd.DataFrame, label_col: str,
+                                close_col: str, time: int,
+                                increase: float) -> bool:
+    """收益滤波器：判断单个窗口内是否存在任意一个"B 标签在前、T 标签在后"的组合。
+
+    条件（见 tsai_classify_train_plan.md 规则 7）：
+        a. B 标签日到 T 标签日相差 <= income_filter.time 个时间节点
+        b. 收盘价从 B 日到 T 日涨幅 >= income_filter.increase
+
+    窗口内任一（B 日, T 日）组合满足即保留（返回 True）；否则删除（返回 False）。
+    收盘价取源数据 close_col（窗口 csv 不输出该列，仅在切片时在内存中判定）。
+    """
+    if time <= 0:
+        return True
+    labels = win_df[label_col].astype(str).str.strip().to_numpy()
+    closes = pd.to_numeric(win_df[close_col], errors="coerce").to_numpy(dtype=float)
+    if closes.size != labels.size:
+        return True
+    n = len(labels)
+    b_days = [i for i in range(n) if labels[i] == "B"]
+    t_days = [i for i in range(n) if labels[i] == "T"]
+    if not b_days or not t_days:
+        return False
+    for bi in b_days:
+        cb = closes[bi]
+        if not np.isfinite(cb) or cb <= 0:
+            continue
+        for ti in t_days:
+            if ti <= bi:
+                continue
+            if ti - bi > time:
+                break  # t_days 升序，后续差距更大
+            ct = closes[ti]
+            if np.isfinite(ct) and ct / cb - 1.0 >= increase:
+                return True
+    return False
+
+
 def slice_file(task: tuple[Path, dict]) -> dict:
     """把单个预处理 CSV 切成多个窗口样本文件。
 
@@ -176,6 +237,7 @@ def slice_file(task: tuple[Path, dict]) -> dict:
     seq_len: int = cfg["seq_len"]
     jump_step: int = cfg["jump_step"]
     throw_last_one: bool = cfg["throw_last_one"]
+    income_filter: dict | None = cfg.get("income_filter")
 
     # 特征列：去掉"日期"（日期仅标识，不参与数值特征）
     feat_cols = [c for c in items if c != DATE_COL]
@@ -189,6 +251,9 @@ def slice_file(task: tuple[Path, dict]) -> dict:
 
     # 校验必需列存在
     need_cols = [DATE_COL] + feat_cols + ([label] if label else [])
+    # 收益滤波器需要源数据中的收盘价（用于判定 B→T 涨幅）
+    if income_filter and CLOSE_COL not in need_cols:
+        need_cols.append(CLOSE_COL)
     missing = [c for c in need_cols if c not in df.columns]
     if missing:
         return {"status": "error", "file": raw_file.name,
@@ -212,20 +277,37 @@ def slice_file(task: tuple[Path, dict]) -> dict:
     out_subdir = dataset_dir / stem
     out_subdir.mkdir(parents=True, exist_ok=True)
 
+    # 收益滤波参数（None 表示不启用）
+    inc_time = int(income_filter["time"]) if income_filter else 0
+    inc_increase = float(income_filter["increase"]) if income_filter else 0.0
+
     n_windows = 0
     removed_single = 0
+    removed_income = 0
     aligned_windows = 0
 
     def save_window(s: int, aligned: bool = False) -> None:
-        """保存起点为 s 的完整窗口；整个窗口同一标签（无分类信息）则跳过。"""
-        nonlocal n_windows, removed_single, aligned_windows
-        win = df.iloc[s:s + seq_len][out_cols].copy()
+        """保存起点为 s 的完整窗口。
+
+        删除规则：
+            - 整个窗口都是同一个标签（无分类信息）；
+            - 启用收益滤波且窗口内无任意一个 B→T 组合满足涨幅条件。
+        """
+        nonlocal n_windows, removed_single, removed_income, aligned_windows
+        full_win = df.iloc[s:s + seq_len]
         # 切片后检查：整个窗口都是同一个标签（无分类信息）则删除，不生成
         if label:
-            win_labels = win[label].dropna().astype(str).str.strip()
+            win_labels = full_win[label].dropna().astype(str).str.strip()
             if win_labels.nunique() <= 1:
                 removed_single += 1
                 return
+        # 收益滤波器：窗口内没有满足条件的 B→T 则删除该窗口样本
+        if inc_time > 0 and CLOSE_COL in full_win.columns:
+            if not window_passes_income_filter(
+                    full_win, label, CLOSE_COL, inc_time, inc_increase):
+                removed_income += 1
+                return
+        win = full_win[out_cols].copy()
         start_date = str(win[DATE_COL].iloc[0])
         end_date = str(win[DATE_COL].iloc[-1])
         out_path = out_subdir / f"{stem}-{start_date}-{end_date}.csv"
@@ -248,6 +330,7 @@ def slice_file(task: tuple[Path, dict]) -> dict:
 
     return {"status": "ok", "file": raw_file.name,
             "windows": n_windows, "removed_single": removed_single,
+            "removed_income": removed_income,
             "aligned": aligned_windows}
 
 
@@ -289,6 +372,12 @@ def main(argv: list[str] | None = None) -> int:
     logging.info("throw_last_one=%s（false 时补生成以最新一天收尾的对齐窗口）", cfg["throw_last_one"])
     logging.info("特征列: %s", [c for c in cfg["items"] if c != DATE_COL])
     logging.info("标签列: %s", cfg["label"])
+    inc = cfg.get("income_filter")
+    if inc:
+        logging.info("收益滤波器已启用: 窗口内 B→T 相差 <= %d 天且涨幅 >= %s",
+                     inc["time"], inc["increase"])
+    else:
+        logging.info("收益滤波器未启用")
     logging.info("并行 worker 数量: %d", n_workers)
 
     # 清理旧切片：本次处理的源文件夹下已有窗口文件会被重新生成，
@@ -308,6 +397,7 @@ def main(argv: list[str] | None = None) -> int:
     skipped = 0
     total_windows = 0
     removed_single = 0
+    removed_income = 0
     total_aligned = 0
     with ProcessPoolExecutor(max_workers=n_workers) as executor:
         for result in executor.map(slice_file, tasks, chunksize=1):
@@ -318,13 +408,16 @@ def main(argv: list[str] | None = None) -> int:
             processed += 1
             total_windows += result.get("windows", 0)
             removed_single += result.get("removed_single", 0)
+            removed_income += result.get("removed_income", 0)
             total_aligned += result.get("aligned", 0)
             if processed % 200 == 0:
                 logging.info("已切片 %d 个文件，生成窗口 %d 个...", processed, total_windows)
 
     logging.info("完成：切片文件 %d 个，跳过 %d 个，生成窗口样本 %d 个"
-                 "（含末尾对齐窗口 %d 个；删除单标签窗口 %d 个）",
-                 processed, skipped, total_windows, total_aligned, removed_single)
+                 "（含末尾对齐窗口 %d 个；删除单标签窗口 %d 个；"
+                 "收益滤波删除 %d 个）",
+                 processed, skipped, total_windows, total_aligned,
+                 removed_single, removed_income)
 
     # 记录切片格式签名，供下次运行校验 dataset 与 config 是否匹配
     write_dataset_signature(dataset_dir, dataset_signature(cfg))

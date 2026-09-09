@@ -1,7 +1,7 @@
 {
   "slice": {
-    "seq_len": 21,
-    "jump_step": 21,
+    "seq_len": 42,
+    "jump_step": 7,
     "items": [
       "NC",
       "NV",
@@ -13,7 +13,11 @@
     "label": [
       "峰值标签"
     ],
-    "throw_last_one": true
+    "throw_last_one": true,
+    "income_filter":{
+      "time": 42,
+      "increase": 0.2
+    }
   },
 
   "data_source": "/Users/jucat/data/ashare/preprocessed",

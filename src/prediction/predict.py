@@ -2,14 +2,16 @@
 """股票分类预测。
 
 从 data_source（预处理数据）对每只股票取最新 seq_len 天数据，用最新训练模型
-预测最新一天的标签（T / B / N），只看 T / B 并按置信度从高到低保存结果。
+预测最新一天的标签（T / B / N），只看 T / B，剔除退市/ST 股后，分别列出
+置信度前 10 的 T 标签股票和 B 标签股票（按置信度从高到低）保存结果。
 
 流程（见 prediction_plan.md）：
 1. 在 test_output 创建 pred-<date> 目录（date 为当前日期）
 2. 读取 config/classify_train.json
 3. 遍历 data_source，切片最新 seq_len 天数据保存到 pred-<date>/dataset
 4. 用最新模型推理，仅分类最新一天的标签
-5. 分类结果只看 T / B，按置信度从高到低保存到 pred-<date>/prediction.log
+5. 分类结果只看 T / B，剔除退市/ST 股，分别列出置信度前 10 的 T 标签股票
+   和 B 标签股票，及其置信度，按置信度从高到低保存到 pred-<date>/prediction.log
 
 用法（需在 tsai conda 环境运行）：
     python3 scripts/prediction.py [--config config/classify_train.json]
@@ -237,25 +239,33 @@ def main(argv: list[str] | None = None) -> int:
     removed_desc = (f"剔除退市/ST {removed_name} 条，停更 {removed_stale} 条"
                     if removed_stale else f"剔除退市/ST {removed_name} 条")
 
-    # 写 prediction.log
+    # 写 prediction.log：剔除退市/ST/停更后，分别列出置信度前 top_n 的 T / B 标签股票
     log_path = out_root / "prediction.log"
+    tb_t = [r for r in tb if r["pred"] == "T"]
+    tb_b = [r for r in tb if r["pred"] == "B"]
+    top_n = 10
     lines = [
         f"预测日期: {date_str}",
         f"模型: {model_path.name}",
         f"数据源: {cfg['data_source']}",
         f"窗口长度(seq_len): {seq_len}",
         f"预测交易日: {rows[0]['date'] if rows else '-'}",
-        f"股票总数: {len(rows)}，T/B 命中: {len(tb_all)}（{removed_desc}）",
+        f"股票总数: {len(rows)}，T/B 命中: {len(tb_all)}（{removed_desc}），"
+        f"其中 T {len(tb_t)}、B {len(tb_b)}",
         "",
-        "分类结果（仅 T / B，剔除退市/ST/停更，按置信度从高到低）:",
-        f"{'排名':<6}{'股票代码':<10}{'股票名称':<16}{'预测':<6}{'置信度':<10}{'交易日'}",
     ]
-    for i, r in enumerate(tb, 1):
-        lines.append(f"{i:<6}{r['code']:<10}{r['name']:<16}{r['pred']:<6}"
-                     f"{r['conf']:.4f}    {r['date']}")
+    header = (f"{'排名':<6}{'股票代码':<10}{'股票名称':<16}{'预测':<6}"
+              f"{'置信度':<10}{'交易日'}")
+    for label, group in (("T", tb_t), ("B", tb_b)):
+        lines.append(f"{label} 标签置信度前 {top_n} 只股票（按置信度从高到低）:")
+        lines.append(header)
+        for i, r in enumerate(group[:top_n], 1):
+            lines.append(f"{i:<6}{r['code']:<10}{r['name']:<16}{r['pred']:<6}"
+                         f"{r['conf']:.4f}    {r['date']}")
+        lines.append("")
     log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    logging.info("分类结果已保存: %s（T/B %d 条，剔除退市/ST %d 条）",
-                 log_path, len(tb), removed)
+    logging.info("分类结果已保存: %s（T %d / B %d 条，各取置信度前 %d）",
+                 log_path, len(tb_t), len(tb_b), top_n)
     logging.info("dataset 目录: %s", dataset_dir)
     return 0
 
