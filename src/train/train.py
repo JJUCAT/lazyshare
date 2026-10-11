@@ -11,6 +11,8 @@
     2. 模型用"任务-时间-batch大小-epochs大小"命名，
        如 <label>_<arch>-YYYYMMDD_HHMMSS-bs32-ep40.pkl。
     3. 同时保存验证集样本清单（<模型名>.valid.json），供 verify.py 使用。
+    4. 训练后清理旧模型：同任务（<label>_<arch>）下仅保留最新 KEEP_MODELS 个
+       模型文件及其验证集清单，避免 models 目录无限增长。
 
 用法：
     python3 src/train/train.py [--config config/classify_train.json] [--limit N] [--dirs N] [-v]
@@ -35,6 +37,9 @@ from src.train.data import (  # noqa: E402
     load_config,
     train_valid_split,
 )
+
+# 同任务（<label>_<arch>）下保留的最新模型数量，训练后清理更旧的模型
+KEEP_MODELS = 10
 
 
 def build_batch_tfms(name):
@@ -91,6 +96,29 @@ def build_ts_classifier(X, y, train_idx, valid_idx, cfg: dict):
         verbose=False,
     )
     return clf
+
+
+def prune_models(models_dir: Path, task: str, keep: int = KEEP_MODELS) -> list[Path]:
+    """清理旧模型：仅保留同任务下最新的 keep 个模型及其验证集清单。
+
+    模型文件名格式为 <label>_<arch>-YYYYMMDD_HHMMSS-bs<bs>-ep<ep>.pkl，
+    时间戳定长且高位在前，故文件名字典序即时间先后顺序；保留字典序最大的
+    keep 个，删除其余 .pkl 及同名的 <模型名>.valid.json。
+
+    返回被删除的文件路径列表。
+    """
+    if keep <= 0:
+        return []
+    candidates = sorted(models_dir.glob(f"{task}-*.pkl"))
+    if len(candidates) <= keep:
+        return []
+    removed: list[Path] = []
+    for old in candidates[:-keep]:
+        for p in (old, old.with_suffix(".valid.json")):
+            if p.exists():
+                p.unlink()
+                removed.append(p)
+    return removed
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -167,6 +195,14 @@ def main(argv: list[str] | None = None) -> int:
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(valid_manifest, f, ensure_ascii=False, indent=2)
     logging.info("验证集清单已保存: %s（%d 条）", manifest_path, len(valid_paths))
+
+    # 训练后清理旧模型：仅保留同任务下最新的 KEEP_MODELS 个模型及其清单
+    removed = prune_models(cfg["models"], task, KEEP_MODELS)
+    if removed:
+        logging.info("已清理旧模型文件 %d 个（仅保留最新 %d 个 %s-*.pkl）",
+                     len(removed), KEEP_MODELS, task)
+    else:
+        logging.info("模型数量未超过 %d 个，无需清理", KEEP_MODELS)
     return 0
 
 
