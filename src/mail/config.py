@@ -4,9 +4,11 @@
 config/mail.json 结构:
     {
       "smtp": { "server": "smtp.163.com", "user": "可选发件人", "auth_code": "..." },
-      "mails": [ "目标邮箱1", ... ],
-      "threshold": 0.9   # 可选，高置信度阈值（默认 0.9）
+      "mails": [ "目标邮箱1", ... ]
     }
+
+说明：邮件正文直接使用预测报告（prediction.log）原文，不再按置信度阈值过滤，
+      故 0.9 阈值相关配置已移除。
 
 说明:
     - 163 邮箱用"授权码"登录，需 smtp.user（发件人邮箱）+ smtp.auth_code
@@ -26,7 +28,6 @@ def load_config(config_path: str | Path = DEFAULT_CONFIG) -> dict:
     {
         "smtp": {"server", "user", "auth_code"},
         "mails": [str, ...],
-        "threshold": float,   # 默认 0.9
     }
     """
     config_path = Path(config_path)
@@ -46,13 +47,7 @@ def load_config(config_path: str | Path = DEFAULT_CONFIG) -> dict:
     if not server or not auth_code or not user:
         raise ValueError("smtp.server / smtp.auth_code / smtp.user 不能为空")
 
-    try:
-        threshold = float(cfg.get("threshold", 0.9))
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"threshold 必须是数字: {cfg.get('threshold')}") from exc
-
     return {
         "smtp": {"server": server, "user": user, "auth_code": auth_code},
         "mails": mails,
-        "threshold": threshold,
     }

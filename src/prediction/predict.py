@@ -3,7 +3,8 @@
 
 从 data_source（预处理数据）对每只股票取最新 seq_len 天数据，用最新训练模型
 预测最新一天的标签（T / B / N），只看 T / B，剔除退市/ST 股后，分别列出
-置信度前 10 的 T 标签股票和 B 标签股票（按置信度从高到低）保存结果。
+置信度前 10 的 T 标签股票和 B 标签股票（按置信度从高到低）保存结果，
+并按配置统计大盘 / 热门行业 / 热门票行情概况一并写入预测日志。
 
 流程（见 prediction_plan.md）：
 1. 在 test_output 创建 pred-<date> 目录（date 为当前日期）
@@ -12,10 +13,15 @@
 4. 用最新模型推理，仅分类最新一天的标签
 5. 分类结果只看 T / B，剔除退市/ST 股，分别列出置信度前 10 的 T 标签股票
    和 B 标签股票，及其置信度，按置信度从高到低保存到 pred-<date>/prediction.log
+6. 按 config/classify_train.json 的 weather 配置统计大盘 / 热门行业 / 热门票
+   行情概况，追加到 pred-<date>/prediction.log
+7. 读取 config/watch.json，把关注名单内股票的标签 / 置信度追加到同一报告
+   （邮件正文即报告原文，故该内容随邮件一并发送）
 
 用法（需在 tsai conda 环境运行）：
     python3 scripts/prediction.py [--config config/classify_train.json]
-                                  [--model models/xxx.pkl] [--date YYYYMMDD] [-v]
+                                  [--model models/xxx.pkl] [--date YYYYMMDD]
+                                  [--watch config/watch.json] [-v]
 """
 from __future__ import annotations
 
@@ -33,6 +39,8 @@ if str(PROJECT_ROOT) not in sys.path:
 import numpy as np
 import pandas as pd
 
+from src.prediction.watch import DEFAULT_WATCH, build_watch_lines
+from src.prediction.weather import build_weather_lines_from_file
 from src.train.data import DATE_COL, DEFAULT_CONFIG, load_config
 
 CODE_COL = "股票代码"
@@ -122,6 +130,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="模型 pkl 路径（默认取 models 目录最新 <label>_<arch>-*.pkl）")
     parser.add_argument("--date", type=str, default=None,
                         help="输出目录日期 YYYYMMDD（默认今天）")
+    parser.add_argument("--watch", type=Path, default=DEFAULT_WATCH,
+                        help="关注名单配置路径（默认: config/watch.json）")
     parser.add_argument("-v", "--verbose", action="store_true", help="输出调试日志")
     args = parser.parse_args(argv)
 
@@ -263,9 +273,22 @@ def main(argv: list[str] | None = None) -> int:
             lines.append(f"{i:<6}{r['code']:<10}{r['name']:<16}{r['pred']:<6}"
                          f"{r['conf']:.4f}    {r['date']}")
         lines.append("")
+
+    # 按配置追加大盘 / 热门行业 / 热门票行情概况
+    # （weather 段会被 load_config 归一化丢弃，故直接读原始配置文件）
+    lines.extend(build_weather_lines_from_file(args.config, windows))
+
+    # 追加 config/watch.json 关注名单：名单内每只股票的标签 / 置信度
+    watch_lines = build_watch_lines(rows, args.watch)
+    if watch_lines:
+        lines.extend(watch_lines)
+
     log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     logging.info("分类结果已保存: %s（T %d / B %d 条，各取置信度前 %d）",
                  log_path, len(tb_t), len(tb_b), top_n)
+    if watch_lines:
+        logging.info("关注名单已写入: %s（%d 只）",
+                     args.watch, len(watch_lines) - 2)  # 减去标题与表头
     logging.info("dataset 目录: %s", dataset_dir)
     return 0
 

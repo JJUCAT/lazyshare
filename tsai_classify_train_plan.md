@@ -35,7 +35,42 @@ config/classify_train.json 时序分类任务训练的配置
   "validation_set": 0.1 // 验证集占比
 }
 
-"evaluate" // 模型评分项
+"evaluate": { // 模型评分项
+  "labels": [ // 观察的标签类型
+    "T",
+    "B"
+  ],
+
+  "items": [ // 评分项
+    "accuracy",
+    "precision",
+    "recall",
+    "f1_score",
+    "roc_auc"
+  ],
+
+  "accuracy_interval": [
+    0.99,
+    0.95,
+    0.90,
+    0.85,
+    0.80
+  ],
+
+  "weather": { // 大盘交易行情概况
+    "global": {
+      "days": 15 // 大盘最近成交量观察天数
+    },
+    "industrys": {
+      "days": 5, // 行业最近成交量观察天数
+      "tops": 3 // 列出成交量最高前几位
+    },
+    "hot_industrys_shares": { // 热门行业热门票
+      "days": 5, // 热门行业成交量观察天数
+      "tops": 3 // 列出成交量最高前几位
+    }
+  }
+}
 
 ----------
 

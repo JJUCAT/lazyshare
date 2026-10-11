@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""邮件发送：读取预测结果（置信度 > threshold），组装邮件并发到目标邮箱。
+"""邮件发送：把预测报告（prediction.log）作为邮件正文发到目标邮箱。
 
 流程（见 run_plan.md）：
     1. 读取 config/mail.json
     2. 定位最新 pred-<date>/prediction.log（可用 --date 指定）
-    3. 解析 T/B 结果，过滤置信度 > threshold 的股票
-    4. 有高置信度信号时发邮件；无信号则跳过并提示
+    3. 邮件正文 = 报告原文，与 weekday.sh 流程的最终报告（预测报告）完全一致
+    4. 报告不存在或为空时跳过发送
 
 用法：
     python3 scripts/mail.py [--config config/mail.json] [--date YYYYMMDD] [--dry-run] [-v]
@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+import html as html_lib
 import logging
 import smtplib
 import sys
@@ -24,50 +25,21 @@ from email.utils import formataddr
 from src.mail.config import DEFAULT_CONFIG, load_config
 from src.mail.predictions import (
     PROJECT_ROOT,
-    filter_high_conf,
     find_latest_pred_dir,
-    parse_prediction_log,
+    parse_trade_date,
+    read_report,
 )
 
-# 标签中文释义
-_PRED_LABEL = {"T": "高峰(T)", "B": "低谷(B)"}
 
-
-def build_body(rows: list[dict], latest_date: str, threshold: float) -> tuple[str, str]:
-    """生成 (纯文本正文, HTML 正文)。rows 为置信度降序的高置信度结果。"""
-    lines = [
-        f"交易日: {latest_date}",
-        f"高置信度信号（置信度 > {threshold:.2f}）: {len(rows)} 只",
-        "",
-        f"{'排名':<4}{'代码':<8}{'名称':<12}{'标签':<8}{'置信度':<8}{'交易日'}",
-        "-" * 52,
-    ]
-    for r in rows:
-        label = _PRED_LABEL.get(r["pred"], r["pred"])
-        lines.append(
-            f"{r['rank']:<4}{r['code']:<8}{r['name']:<12}{label:<10}"
-            f"{r['conf']:.4f}    {r['date']}"
-        )
-    text = "\n".join(lines)
-
-    trs = "\n".join(
-        "<tr>"
-        f"<td>{r['rank']}</td><td>{r['code']}</td><td>{r['name']}</td>"
-        f"<td>{_PRED_LABEL.get(r['pred'], r['pred'])}</td>"
-        f"<td>{r['conf']:.4f}</td><td>{r['date']}</td>"
-        "</tr>"
-        for r in rows
-    )
+def build_body(report: str) -> tuple[str, str]:
+    """生成 (纯文本正文, HTML 正文)：正文即预测报告原文，不做任何增删。"""
+    text = report if report.endswith("\n") else report + "\n"
     html = (
-        "<html><body style='font-family:Menlo,monospace;font-size:13px'>"
-        f"<h3>高置信度预测信号（置信度 > {threshold:.2f}）</h3>"
-        f"<p>交易日: <b>{latest_date}</b>，共 <b>{len(rows)}</b> 只</p>"
-        "<table border='1' cellspacing='0' cellpadding='6' "
-        "style='border-collapse:collapse'>"
-        "<tr style='background:#f0f0f0'><th>排名</th><th>代码</th><th>名称</th>"
-        "<th>标签</th><th>置信度</th><th>交易日</th></tr>"
-        f"{trs}"
-        "</table></body></html>"
+        "<html><body>"
+        "<pre style='font-family:Menlo,Consolas,monospace;font-size:13px;"
+        "white-space:pre-wrap;margin:0'>"
+        f"{html_lib.escape(text)}"
+        "</pre></body></html>"
     )
     return text, html
 
@@ -89,7 +61,7 @@ def send_mail(smtp_cfg: dict, subject: str, text: str, html: str,
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="把预测结果中置信度 > 阈值的股票标签发送邮件")
+        description="把预测报告（prediction.log）发送到目标邮箱")
     parser.add_argument("--config", type=str, default=str(DEFAULT_CONFIG),
                         help="邮件配置文件（默认: config/mail.json）")
     parser.add_argument("--date", type=str, default=None,
@@ -104,10 +76,8 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 
     cfg = load_config(args.config)
-    smtp_cfg = cfg["smtp"]
-    threshold = cfg["threshold"]
 
-    # 定位预测目录 / prediction.log
+    # 定位预测目录 / 报告文件
     if args.date:
         pred_dir = PROJECT_ROOT / "test_output" / f"pred-{args.date}"
         if not pred_dir.is_dir():
@@ -119,29 +89,26 @@ def main(argv: list[str] | None = None) -> int:
             logging.error("test_output 下未找到 pred-* 预测目录")
             return 1
     log_path = pred_dir / "prediction.log"
-    logging.info("预测结果: %s", log_path)
+    logging.info("预测报告: %s", log_path)
 
-    rows = parse_prediction_log(log_path)
-    high = filter_high_conf(rows, threshold)
-    logging.info("T/B 共 %d 条，置信度 > %.2f 的有 %d 条",
-                 len(rows), threshold, len(high))
-
-    if not high:
-        logging.info("无置信度 > %.2f 的信号，本次不发送邮件", threshold)
+    report = read_report(log_path)
+    if not report.strip():
+        logging.info("预测报告为空或不存在，本次不发送邮件")
         return 0
 
-    # 交易日取最高置信度那行的日期
-    latest_date = high[0]["date"]
-    subject = f"【lazyshare】{latest_date} 高置信度预测信号（{len(high)} 只）"
-    text, html = build_body(high, latest_date, threshold)
+    # 交易日取报告中的"预测交易日"，取不到则用预测目录名的日期
+    trade_date = parse_trade_date(report, fallback=pred_dir.name.removeprefix("pred-"))
+    subject = f"【lazyshare】{trade_date} 预测报告"
+    text, html = build_body(report)
 
     if args.dry_run:
         print(subject)
-        print(text)
+        # 直接写出报告原文（text 已带结尾换行），避免 print 额外插入空行
+        sys.stdout.write(text)
         logging.info("dry-run：不实际发送")
         return 0
 
-    send_mail(smtp_cfg, subject, text, html, cfg["mails"])
+    send_mail(cfg["smtp"], subject, text, html, cfg["mails"])
     logging.info("已发送邮件到 %d 个邮箱: %s", len(cfg["mails"]), cfg["mails"])
     logging.info("主题: %s", subject)
     return 0

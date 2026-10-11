@@ -1,9 +1,16 @@
 # -*- coding: utf-8 -*-
-"""预测结果解析：定位最新 pred-* 目录、解析 prediction.log、按置信度过滤。
+"""预测报告读取：定位最新 pred-* 目录，读取 prediction.log（最终报告）原文。
 
-prediction.log 由 src/prediction/predict.py 生成，T/B 结果行格式:
-    排名    股票代码    股票名称    预测    置信度    交易日
-    1     603221    爱丽家居     T     0.9432    2026-09-01
+prediction.log 由 src/prediction/predict.py 生成，是 weekday 流程的最后一份报告，
+内容依次为：
+    预测日期 / 模型 / 数据源 / 窗口长度(seq_len) / 预测交易日 / 股票总数统计
+    T 标签置信度前 10 只股票（按置信度从高到低）
+    B 标签置信度前 10 只股票（按置信度从高到低）
+    大盘交易行情概况 / 热门行业 / 热门行业热门票
+    关注名单（config/watch.json）内每只股票的标签 / 置信度
+
+邮件正文与该报告保持一致（直接发送报告原文），故此处只做"定位 + 读取 + 取交易日"。
+关注名单由 predict.py 写入报告，随报告原文一并进入邮件正文。
 """
 from __future__ import annotations
 
@@ -13,10 +20,11 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 TEST_OUTPUT = PROJECT_ROOT / "test_output"
 
-# 排名 / 6 位代码 / 名称(无空格) / T|B / 置信度 / 日期
-_LINE_RE = re.compile(
-    r"^\s*(\d+)\s+(\d{6})\s+(\S+)\s+([TB])\s+(\d+(?:\.\d+)?)\s+(\S+)\s*$"
-)
+# 预测报告文件名
+REPORT_NAME = "prediction.log"
+
+# 报告头部行形如 "预测交易日: 2026-09-11"
+_TRADE_DATE_RE = re.compile(r"^\s*预测交易日\s*[:：]\s*(\S+)\s*$", re.MULTILINE)
 
 
 def find_latest_pred_dir(test_output: Path = TEST_OUTPUT) -> Path | None:
@@ -27,28 +35,20 @@ def find_latest_pred_dir(test_output: Path = TEST_OUTPUT) -> Path | None:
     return sorted(dirs, key=lambda p: p.name, reverse=True)[0]
 
 
-def parse_prediction_log(log_path: Path) -> list[dict]:
-    """解析 prediction.log 的 T/B 结果行，返回:
-    [{rank, code, name, pred, conf, date}, ...]（保持文件顺序，即置信度降序）
-    """
-    rows: list[dict] = []
+def read_report(log_path: Path) -> str:
+    """读取预测报告（prediction.log）原文；文件不存在时返回空串。"""
     if not log_path.exists():
-        return rows
-    for line in log_path.read_text(encoding="utf-8").splitlines():
-        m = _LINE_RE.match(line)
-        if not m:
-            continue
-        rows.append({
-            "rank": int(m.group(1)),
-            "code": m.group(2),
-            "name": m.group(3),
-            "pred": m.group(4),
-            "conf": float(m.group(5)),
-            "date": m.group(6),
-        })
-    return rows
+        return ""
+    return log_path.read_text(encoding="utf-8")
 
 
-def filter_high_conf(rows: list[dict], threshold: float) -> list[dict]:
-    """仅保留置信度大于 threshold 的结果（保持降序）。"""
-    return [r for r in rows if r["conf"] > threshold]
+def parse_trade_date(report: str, fallback: str = "") -> str:
+    """从报告原文提取"预测交易日"（用于邮件主题）；取不到时返回 fallback。
+
+    报告中该行由 predict.py 写入，无 T/B 命中时值为 "-"，此时同样回退到 fallback。
+    """
+    m = _TRADE_DATE_RE.search(report or "")
+    if not m:
+        return fallback
+    value = m.group(1).strip()
+    return value if value and value != "-" else fallback

@@ -7,8 +7,9 @@
 #
 # 说明:
 #   - 生成 ~/Library/LaunchAgents/com.lazyshare.weekday.plist
-#   - launchd 的 StartCalendarInterval 每天 21:00 触发，周一至周五判断在 src/run.py 的
-#     --weekday 模式内完成（launchd 无法直接表达"1-5"，故触发后由 weekday 模式过滤）
+#   - launchd 的 StartCalendarInterval 每天 21:00 触发（带 --scheduled），周一至周五判断在
+#     src/run.py 的 --weekday 模式内完成（launchd 无法直接表达"1-5"，故触发后由 weekday 模式过滤）
+#   - 手动执行 scripts/weekday.sh 不带 --scheduled，不做工作日检查
 #   - 卸载: launchctl unload + 删除 plist
 
 set -euo pipefail
@@ -28,7 +29,7 @@ fi
 
 mkdir -p "${AGENTS_DIR}" "${LOG_DIR}"
 
-# 生成 plist（每天 21:00；工作日过滤见 src/run.py --weekday）
+# 生成 plist（每天 21:00；--scheduled 表示由 launchd 触发，工作日过滤见 src/run.py --weekday）
 cat > "${PLIST_DEST}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -40,6 +41,7 @@ cat > "${PLIST_DEST}" <<EOF
     <array>
         <string>/bin/bash</string>
         <string>${PROJECT_ROOT}/scripts/weekday.sh</string>
+        <string>--scheduled</string>
     </array>
     <key>StartCalendarInterval</key>
     <dict>
@@ -66,7 +68,7 @@ echo "已安装 launchd 服务: ${LABEL}"
 echo "  plist : ${PLIST_DEST}"
 echo "  脚本  : ${PROJECT_ROOT}/scripts/weekday.sh"
 echo "  日志  : ${LOG_DIR}/weekday.log / weekday.err.log"
-echo "  触发  : 每个工作日 21:00"
+echo "  触发  : 每天 21:00（定时执行时校验工作日）"
 echo ""
-echo "手动验证: bash scripts/weekday.sh --dry-run"
+echo "手动验证: bash scripts/weekday.sh --dry-run   # 主动执行不检查工作日"
 echo "卸载服务: bash scripts/weekday_install.sh --remove"

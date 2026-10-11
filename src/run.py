@@ -44,7 +44,7 @@ STEP_DESCRIPTION = {
     "update": "更新个股历史数据（scripts/update.py）",
     "preprocess": "更新预处理数据（scripts/preprocess.py --update）",
     "predict": "估计最新股票标签（scripts/prediction.sh）",
-    "mail": "发送高置信度预测信号邮件（scripts/mail.py）",
+    "mail": "发送预测报告邮件（scripts/mail.py，正文与 prediction.log 一致）",
 }
 
 
