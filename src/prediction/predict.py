@@ -42,6 +42,7 @@ import pandas as pd
 from src.prediction.watch import DEFAULT_WATCH, build_watch_lines
 from src.prediction.weather import build_weather_lines_from_file
 from src.train.data import DATE_COL, DEFAULT_CONFIG, load_config
+from src.train.norm import apply_batch_tfms
 
 CODE_COL = "股票代码"
 NAME_COL = "股票名称"
@@ -55,11 +56,17 @@ def load_learner(model_path: Path):
     return _load_learner(model_path)
 
 
-def model_forward(learn, windows: np.ndarray) -> np.ndarray:
-    """对模型 forward，返回 softmax 概率 (n, n_classes)，列序 = 训练时 classes。"""
+def model_forward(learn, windows: np.ndarray, batch_tfms=None) -> np.ndarray:
+    """对模型 forward，返回 softmax 概率 (n, n_classes)，列序 = 训练时 classes。
+
+    batch_tfms 必须与训练时一致：TSStandardize 注册在 DataLoader 的 after_batch
+    管线里，不在 learn.model 内部，因此这里先用 apply_batch_tfms 复现同一标准化
+    再前向，否则训练/推理输入分布不一致（见 src/train/norm.py）。
+    """
     import torch
     dev = next(learn.model.parameters()).device
-    x = torch.as_tensor(windows, dtype=torch.float32, device=dev)
+    arr = apply_batch_tfms(windows, batch_tfms)
+    x = torch.as_tensor(arr, dtype=torch.float32, device=dev)
     with torch.no_grad():
         logits = learn.model(x)
     return torch.softmax(logits, dim=-1).cpu().numpy()
@@ -169,7 +176,14 @@ def main(argv: list[str] | None = None) -> int:
     seq_len = int(m.get("seq_len", cfg["seq_len"]))
     classes = m.get("classes") or ["B", "N", "T"]
     weights = m.get("loss_label_weight") or {}
-    logging.info("特征列: %s, seq_len: %d, 类别顺序: %s", items, seq_len, classes)
+    # 推理决策是否再用 weights 对概率加权（默认 none：训练已加权，避免重复加权）
+    decision_weight = str(
+        m.get("decision_weight", cfg.get("decision_weight", "none"))).strip().lower()
+    # 训练时的 batch_tfms，推理前必须复现（旧模型清单无该字段时回退到当前配置）
+    batch_tfms = m.get("batch_tfms", cfg.get("batch_tfms"))
+    logging.info("特征列: %s, seq_len: %d, 类别顺序: %s, batch_tfms: %s, "
+                 "loss_label_weight: %s, decision_weight: %s",
+                 items, seq_len, classes, batch_tfms, weights, decision_weight)
 
     # 遍历 data_source 切片最新窗口
     raw_files = sorted(cfg["data_source"].glob("*.csv"))
@@ -199,13 +213,19 @@ def main(argv: list[str] | None = None) -> int:
         name = str(last[NAME_COL]).strip()
         metas.append((stem, code, name, str(last[DATE_COL])))
     X_all = np.stack(xs)  # (n, vars, seq_len)
-    probas = model_forward(learn, X_all)  # (n, n_classes)
+    probas = model_forward(learn, X_all, batch_tfms=batch_tfms)  # (n, n_classes)
     logging.info("推理完成: %d 只股票", len(metas))
 
-    # 决策边界按标签权重调整（与训练/验证一致）
-    w = np.array([float(weights.get(c, 1.0)) for c in classes], dtype=float)
-    scored = probas * w[None, :]
-    pred_idx = np.argmax(scored, axis=-1)
+    # 决策边界：默认纯 argmax(probas)。
+    # 训练已用 loss_label_weight 加权（偏置已学进模型），此处若再乘一次相同权重
+    # 会让小类被过度预测（如 B=10 时大量 N/T 被强行判成 B）。
+    # 仅在显式配置 decision_weight="loss" 时沿用旧的二次加权行为。
+    if decision_weight == "loss" and weights:
+        w = np.array([float(weights.get(c, 1.0)) for c in classes], dtype=float)
+        pred_idx = np.argmax(probas * w[None, :], axis=-1)
+        logging.info("决策边界: probas × loss_label_weight %s", weights)
+    else:
+        pred_idx = np.argmax(probas, axis=-1)
 
     # 汇总结果：只看 T / B，剔除退市 / ST 股，按置信度降序
     rows: list[dict] = []

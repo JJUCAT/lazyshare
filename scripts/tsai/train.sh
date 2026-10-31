@@ -2,7 +2,7 @@
 # 快捷启动 tsai 分类任务的训练 / 验证 / 评分
 #
 # 用法:
-#   bash scripts/tsai/train.sh                          # 无参数：自动 训练→验证→评分 全流程
+#   bash scripts/tsai/train.sh                          # 无参数：自动 训练→验证+测试 全流程
 #   bash scripts/tsai/train.sh [train|verify|evaluate] [选项...]   # 带子命令：单独执行
 #
 # 子命令:
@@ -11,9 +11,10 @@
 #   evaluate 仅运行评分，透传参数给 src/train/evaluate.py
 #
 # 示例:
-#   bash scripts/tsai/train.sh                          # 全流程：训练→验证→评分
+#   bash scripts/tsai/train.sh                          # 全流程：训练→验证+测试
 #   bash scripts/tsai/train.sh train --limit 300 --epochs 2 -v   # 仅训练（小规模调试）
-#   bash scripts/tsai/train.sh verify -v                # 仅验证最新模型
+#   bash scripts/tsai/train.sh verify -v                # 验证+测试最新模型
+#   bash scripts/tsai/train.sh verify --split test      # 只跑测试集
 #   bash scripts/tsai/train.sh verify --model models/xxx.pkl     # 验证指定模型
 #   bash scripts/tsai/train.sh evaluate <results.json>  # 仅对结构化结果评分
 #
@@ -83,20 +84,13 @@ fi
 # 5. 激活环境
 conda activate "${ENV_NAME}"
 
-# 6. 无参数：自动执行 训练→验证→评分 全流程
+# 6. 无参数：自动执行 训练→验证+测试 全流程
+#    训练报告 / 验证报告 / 测试报告都会输出到模型目录（<models>/<模型名>.{train,valid,test}.log）
 if [[ "${CMD}" == "all" ]]; then
-    echo "==== [1/3] 训练 ===="
+    echo "==== [1/2] 训练（含训练报告） ===="
     python "${TRAIN_PY}"
-    echo "==== [2/3] 验证 ===="
-    python "${VERIFY_PY}"
-    echo "==== [3/3] 评分 ===="
-    # 取最新生成的 results.json（validation 下最新模型目录）
-    LATEST_RESULTS="$(find "$(python -c "import json,sys; print(json.load(open('${PROJECT_ROOT}/config/classify_train.json'))['validation'])")" -name results.json 2>/dev/null | sort | tail -1)"
-    if [[ -z "${LATEST_RESULTS}" ]]; then
-        echo "[ERROR] 未找到验证生成的 results.json，评分步骤跳过。" >&2
-        exit 1
-    fi
-    python "${EVALUATE_PY}" "${LATEST_RESULTS}"
+    echo "==== [2/2] 验证 + 测试（含验证/测试报告） ===="
+    python "${VERIFY_PY}" --split all
     echo ""
     echo "[OK] 全流程完成！"
     exit 0

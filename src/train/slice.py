@@ -16,11 +16,13 @@
     3. 切片保存为 CSV，必须保留"日期"列；文件名 = 源文件名-开始日期-结束日期.csv。
     4. 同一个数据源（源 CSV）的切片保存在 dataset 路径下的同名文件夹中：
        输出路径 = dataset/<源文件名>/<源文件名>-开始日期-结束日期.csv。
-    5. 正向平铺切完后若末尾剩余不足一个完整窗口（seq_len），按 throw_last_one
-       决定是否补一个"以文件最后一天收尾"的对齐窗口样本：
-       - true（默认）：丢弃，只保留正向平铺的窗口；
-       - false：补生成该完整窗口（起点 len-seq_len，与前面平铺窗口尾部重叠），
-         使训练样本覆盖"预测最新一天"的情形。
+    5. 窗口不允许重叠：要求 jump_step >= seq_len，且 throw_last_one 必须为 true。
+       原因：train/verify 按窗口随机划分训练集与验证集，重叠窗口会让同一段行情
+       同时出现在训练集和验证集（数据泄漏），验证指标失去意义。
+       - jump_step == seq_len：无缝平铺，窗口间零重叠；
+       - jump_step > seq_len：窗口间留有空隙，同样不重叠；
+       - throw_last_one=false 会补一个以文件最后一天收尾的窗口（起点
+         len-seq_len），它与前面的平铺窗口尾部重叠，故被禁止。
     6. 收益滤波器（income_filter）：对每个窗口样本，若窗口内不存在任意一个
        "B 标签在前、T 标签在后"的组合，满足
        - B 日到 T 日相差 <= income_filter.time 个时间节点，
@@ -93,6 +95,19 @@ def load_train_config(config_path: Path) -> dict:
         items = [DATE_COL] + items  # 保证日期列参与输出，但不作为数值特征
     if seq_len <= 0 or jump_step <= 0:
         raise ValueError("slice.seq_len / slice.jump_step 必须为正整数")
+    # 窗口必须不重叠：jump_step >= seq_len。否则同一只股票相邻窗口共享大部分数据
+    # （如 seq_len=42、jump_step=7 时重叠 35/42），而 train/verify 是按窗口随机
+    # 划分训练集与验证集的，重叠窗口会跨集泄漏，使验证指标虚高。
+    if jump_step < seq_len:
+        raise ValueError(
+            f"slice.jump_step({jump_step}) 必须 >= slice.seq_len({seq_len})："
+            f"窗口不允许重叠，否则训练集与验证集共享同一段行情数据（数据泄漏）")
+    # throw_last_one=False 会额外补一个"以文件最后一天收尾"的窗口，其起点为
+    # len-seq_len，与前面的平铺窗口尾部重叠，同样破坏"窗口不重叠"约束。
+    if not throw_last_one:
+        raise ValueError(
+            "slice.throw_last_one 必须为 true：补生成的末尾对齐窗口会与前面的"
+            "平铺窗口重叠，破坏训练/验证集不重叠的约束")
 
     return {
         "data_source": data_source,

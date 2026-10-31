@@ -34,9 +34,11 @@ import numpy as np  # noqa: E402
 from src.train.data import (  # noqa: E402
     DEFAULT_CONFIG,
     collect_samples,
+    label_counts,
     load_config,
-    train_valid_split,
+    stratified_split,
 )
+from src.train.report import split_table, write_report  # noqa: E402
 
 # 同任务（<label>_<arch>）下保留的最新模型数量，训练后清理更旧的模型
 KEEP_MODELS = 10
@@ -96,6 +98,66 @@ def build_ts_classifier(X, y, train_idx, valid_idx, cfg: dict):
         verbose=False,
     )
     return clf
+
+
+def build_train_callbacks(cfg: dict, model_name: str, models_dir: Path):
+    """构造"早停 + 最优权重回滚"回调。
+
+    解决的问题：`fit_one_cycle(epochs, lr)` 跑满全部 epoch 后导出的是**最后一轮**
+    的权重，而验证损失通常在早中期就已触底（本任务 epoch 13 的 valid_loss 0.390，
+    epoch 30 已涨到 1.190）。导出过拟合权重会使少数类（B）的决策边界进一步塌缩。
+
+    两个回调分工：
+        - SaveModelCallback   ：每轮按 monitor 比较，刷新最优权重文件；训练结束时
+                                fastai 会自动 load 回最优权重（on_train_end）。
+        - EarlyStoppingCallback：连续 patience 轮没有超过 min_delta 的改善就提前终止。
+
+    监控指标优先用 valid_loss（连续、稳定）。用 accuracy 这类离散指标时平台期会
+    反复抖动，min_delta 建议给 0.001~0.01。
+
+    注意：fit_one_cycle 的 lr 调度按**总 epoch 数**规划，若早停频繁在调度中段触发，
+    模型还没走完 lr 衰减段；此时可把 epochs 调大或改用平缓调度（fit_flat_cos）。
+
+    返回 (callbacks, info)。info 含 monitor / patience / min_delta / lower_better /
+    best_name / best_file，供日志、训练报告与样本清单记录。patience=0 时只回滚不早停。
+    """
+    from fastai.callback.tracker import EarlyStoppingCallback, SaveModelCallback
+
+    es = cfg.get("early_stopping") or {}
+    monitor = str(es.get("monitor") or "valid_loss").strip() or "valid_loss"
+    patience = int(es.get("patience", 5))
+    min_delta = float(es.get("min_delta", 0.0))
+    if patience < 0:
+        raise ValueError(
+            f"early_stopping.patience 必须 >= 0（0 表示不早停），当前 {patience}")
+    # loss / error 类指标越小越好，accuracy / f1 等越大越好
+    lower_better = any(k in monitor.lower()
+                       for k in ("loss", "error", "rmse", "mae", "mse"))
+    comp = np.less if lower_better else np.greater
+
+    # 用绝对路径作为 fname：fastai 的 save/load 都做 path/f'{name}.pth'，
+    # 而 Path 拼接绝对路径会直接替换左侧，故不受 learn.path 影响。
+    # 目录必须先存在：SaveModelCallback 的 after_epoch 直接 torch.save，
+    # 父目录缺失会抛 RuntimeError 中断训练（不依赖调用方是否已建目录）。
+    Path(models_dir).mkdir(parents=True, exist_ok=True)
+    best_name = str(Path(models_dir) / f"{model_name}.best")
+    cbs = []
+    if cfg.get("save_best", True):
+        cbs.append(SaveModelCallback(
+            monitor=monitor, comp=comp, min_delta=min_delta,
+            fname=best_name, with_opt=False, at_end=False, reset_on_fit=True))
+    if patience > 0:
+        cbs.append(EarlyStoppingCallback(
+            monitor=monitor, comp=comp, min_delta=min_delta, patience=patience))
+    info = {
+        "monitor": monitor,
+        "patience": patience,
+        "min_delta": min_delta,
+        "lower_better": lower_better,
+        "best_name": best_name if cfg.get("save_best", True) else None,
+        "best_file": best_name + ".pth",
+    }
+    return cbs, info
 
 
 def prune_models(models_dir: Path, task: str, keep: int = KEEP_MODELS) -> list[Path]:
@@ -158,43 +220,172 @@ def main(argv: list[str] | None = None) -> int:
     logging.info("标签分布: %s",
                  {k: int((y == k).sum()) for k in sorted(set(y.tolist()))})
 
-    # 按 seed 随机划分：训练集占 1-validation_set，验证集占 validation_set
-    train_idx, valid_idx = train_valid_split(n, cfg["validation_set"], cfg["seed"])
-    logging.info("划分: 训练 %d，验证 %d", len(train_idx), len(valid_idx))
+    # 按末日标签分层划分 训练/验证/测试（默认 6:2:2）：
+    # 在每个类别内部独立切分，保证三个集合的 T/B/N 占比与全集一致
+    train_idx, valid_idx, test_idx = stratified_split(
+        y, cfg["split_ratio"], cfg["seed"])
+    split_indices = {"train": train_idx, "valid": valid_idx, "test": test_idx}
+    split_paths = {name: [str(paths[i]) for i in idx]
+                   for name, idx in split_indices.items()}
+    split_stats = {name: label_counts(y, idx) for name, idx in split_indices.items()}
+    logging.info("分层划分 %s: 训练 %d，验证 %d，测试 %d",
+                 "/".join(f"{r:g}" for r in cfg["split_ratio"]),
+                 len(train_idx), len(valid_idx), len(test_idx))
+    for _name, _st in split_stats.items():
+        logging.info("  %-5s 标签分布: %s", _name, _st)
 
     clf = build_ts_classifier(X, y, train_idx, valid_idx, cfg)
-    logging.info("开始训练: arch=%s, batch_size=%d, epochs=%d, lr=%s",
-                 cfg["arch"], cfg["batch_size"], cfg["epochs"], cfg["learning_rate"])
-    clf.fit_one_cycle(cfg["epochs"], cfg["learning_rate"])
-    logging.info("训练完成")
 
     # 模型用"任务-时间-batch大小-epochs大小"命名
+    # 需在训练前生成：最优权重临时文件与其同名（见 build_train_callbacks）
     task = f"{cfg['label']}_{cfg['arch']}"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     model_name = f"{task}-{timestamp}-bs{cfg['batch_size']}-ep{cfg['epochs']}"
     cfg["models"].mkdir(parents=True, exist_ok=True)
     model_path = cfg["models"] / f"{model_name}.pkl"
+
+    callbacks, es_info = build_train_callbacks(cfg, model_name, cfg["models"])
+    logging.info("开始训练: arch=%s, batch_size=%d, epochs=%d, lr=%s",
+                 cfg["arch"], cfg["batch_size"], cfg["epochs"], cfg["learning_rate"])
+    logging.info("早停/最优权重回滚: monitor=%s, patience=%d, min_delta=%s, save_best=%s",
+                 es_info["monitor"], es_info["patience"], es_info["min_delta"],
+                 cfg.get("save_best", True))
+    clf.fit_one_cycle(cfg["epochs"], cfg["learning_rate"], cbs=callbacks or None)
+
+    trained_epochs = len(clf.recorder.values)
+    stopped_early = trained_epochs < cfg["epochs"]
+    # 回滚到监控指标最优的权重。
+    # SaveModelCallback 在 on_train_end 已自动 load 过一次，这里显式再 load 一次：
+    # 幂等、且能覆盖"回调未注册成功/内部提前返回"的情况，保证导出的一定是最优权重。
+    rolled_back = False
+    if es_info.get("best_name") and Path(es_info["best_file"]).exists():
+        clf.load(es_info["best_name"])
+        rolled_back = True
+    logging.info("训练完成: 实际 %d/%d 轮%s，导出权重=%s",
+                 trained_epochs, cfg["epochs"],
+                 "（早停触发）" if stopped_early else "（跑满）",
+                 f"最优 epoch（{es_info['monitor']}）" if rolled_back else "最后一轮")
+
     clf.export(model_path)
     logging.info("模型已保存: %s", model_path)
+    # 最优权重临时文件内容已并入 pkl，删除避免 models 目录堆积
+    if rolled_back:
+        try:
+            Path(es_info["best_file"]).unlink()
+            logging.info("已清理最优权重临时文件: %s", es_info["best_file"])
+        except OSError as exc:  # noqa: BLE001
+            logging.warning("清理最优权重临时文件失败: %s", exc)
 
-    # 保存验证集样本清单（供 verify.py 使用）
+    # 保存样本清单（供 verify.py 验证 / 测试使用）
     import json
-    valid_paths = [str(paths[i]) for i in valid_idx]
     classes = sorted(set(y.tolist()))  # 与 TSClassification vocab 顺序一致（sort=True）
-    valid_manifest = {
+    manifest = {
         "model": model_name,
         "label": cfg["label"],
         "items": cfg["items"],
         "seq_len": cfg["seq_len"],
         "classes": classes,
-        # 决策边界按标签权重调整：推理（verify.py）据此对 probas 加权后再取类别
+        # 训练时使用的 batch_tfms：推理（verify.py / predict.py）据此复现同一
+        # 标准化（见 src/train/norm.py），保证训练与推理输入分布一致
+        "batch_tfms": cfg.get("batch_tfms"),
+        # 训练损失权重（仅作用于训练阶段）
         "loss_label_weight": cfg.get("loss_label_weight"),
-        "valid_paths": valid_paths,
+        # 推理决策是否再按上面权重对概率加权（"none" 表示纯 argmax）
+        "decision_weight": cfg.get("decision_weight"),
+        # 早停 / 最优权重回滚的实际执行情况（便于追溯 pkl 对应哪一轮）
+        "early_stopping": {
+            "monitor": es_info["monitor"],
+            "patience": es_info["patience"],
+            "min_delta": es_info["min_delta"],
+        },
+        "trained_epochs": trained_epochs,
+        "stopped_early": stopped_early,
+        "rolled_back_to_best": rolled_back,
+        # 分层划分比例与三集合的窗口清单 / 标签分布（6:2:2，类别比例一致）
+        "split_ratio": list(cfg["split_ratio"]),
+        "split_paths": split_paths,
+        "split_stats": split_stats,
+        # 兼容旧字段
+        "valid_paths": split_paths["valid"],
     }
     manifest_path = cfg["models"] / f"{model_name}.valid.json"
     with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump(valid_manifest, f, ensure_ascii=False, indent=2)
-    logging.info("验证集清单已保存: %s（%d 条）", manifest_path, len(valid_paths))
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    logging.info("样本清单已保存: %s（train %d / valid %d / test %d）",
+                 manifest_path, len(split_paths["train"]),
+                 len(split_paths["valid"]), len(split_paths["test"]))
+
+    # ---- 训练报告：配置 + 数据划分统计 + 逐 epoch 训练曲线 ----
+    report = [
+        f"模型: {model_name}",
+        f"生成时间: {datetime.now():%Y-%m-%d %H:%M:%S}",
+        f"数据源: {cfg['data_source']}",
+        f"dataset: {cfg['dataset']}",
+        f"特征列: {cfg['items']}",
+        f"标签列: {cfg['label']}",
+        f"seq_len: {cfg['seq_len']}",
+        f"架构: {cfg['arch']}",
+        f"batch_size: {cfg['batch_size']}   epochs: {cfg['epochs']}"
+        f"   learning_rate: {cfg['learning_rate']}",
+        f"batch_tfms: {cfg.get('batch_tfms')}",
+        f"loss_label_weight: {cfg.get('loss_label_weight')}",
+        f"decision_weight: {cfg.get('decision_weight')}"
+        f"（none=推理仅用 argmax，loss=推理再乘一次上述权重）",
+        f"early_stopping: {cfg.get('early_stopping')}   save_best: {cfg.get('save_best')}",
+        f"随机种子: {cfg['seed']}",
+        f"分层划分比例(train/valid/test): "
+        f"{'/'.join(f'{r:g}' for r in cfg['split_ratio'])}",
+        "",
+        "== 数据划分（按末日标签分层，保证三集合类别占比一致） ==",
+        split_table(y, split_indices, classes),
+        "",
+        "== 训练曲线 ==",
+    ]
+    try:
+        metric_names = [str(x) for x in clf.recorder.metric_names[1:]]
+        values = clf.recorder.values
+        report.append(f"{'epoch':<7}" + "".join(f"{n:>14}" for n in metric_names))
+        for ep, row in enumerate(values, 1):
+            cells = ""
+            for v in row:
+                try:
+                    cells += f"{float(v):>14.6f}"
+                except (TypeError, ValueError):
+                    cells += f"{str(v):>14}"
+            report.append(f"{ep:<7}{cells}")
+        # ---- 早停 / 最优权重回滚摘要 ----
+        # 报告必须能回答"这个 pkl 对应哪一轮"，否则无法判断导出的是否过拟合权重
+        report += [
+            "",
+            "== 早停 / 最优权重回滚 ==",
+            f"监控指标: {es_info['monitor']}"
+            f"（{'越小越好' if es_info['lower_better'] else '越大越好'}）"
+            f"  patience: {es_info['patience']}  min_delta: {es_info['min_delta']}",
+            f"实际训练轮数: {trained_epochs}/{cfg['epochs']}"
+            + ("（早停触发）" if stopped_early else "（跑满全部 epoch）"),
+            "导出权重: "
+            + (f"已回滚到 {es_info['monitor']} 最优 epoch" if rolled_back
+               else "最后一轮（未启用 save_best 或未找到最优权重文件）"),
+        ]
+        if values and es_info["monitor"] in metric_names:
+            mi = metric_names.index(es_info["monitor"])
+            col = [float(v[mi]) for v in values]
+            bi = int(np.argmin(col)) if es_info["lower_better"] else int(np.argmax(col))
+            report.append(f"最优 epoch: {bi + 1}"
+                          f"（{es_info['monitor']}={col[bi]:.6f}）")
+        if "accuracy" in metric_names and values:
+            ai = metric_names.index("accuracy")
+            best = max(range(len(values)), key=lambda i: float(values[i][ai]))
+            report += ["",
+                       f"best valid accuracy: {float(values[best][ai]):.4f}"
+                       f"（epoch {best + 1}，仅作记录；权重按 "
+                       f"{es_info['monitor']} 选择）",
+                       f"last valid accuracy: {float(values[-1][ai]):.4f}"]
+    except Exception as exc:  # noqa: BLE001
+        report.append(f"训练曲线读取失败: {exc}")
+    train_report_path = cfg["models"] / f"{model_name}.train.log"
+    write_report(train_report_path, report)
+    logging.info("训练报告已保存: %s", train_report_path)
 
     # 训练后清理旧模型：仅保留同任务下最新的 KEEP_MODELS 个模型及其清单
     removed = prune_models(cfg["models"], task, KEEP_MODELS)

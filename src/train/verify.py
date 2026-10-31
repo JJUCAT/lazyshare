@@ -31,6 +31,7 @@ import json
 import logging
 import sys
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -44,6 +45,12 @@ from src.train.data import (  # noqa: E402
     DATE_COL,
     DEFAULT_CONFIG,
     load_config,
+)
+from src.train.norm import apply_batch_tfms  # noqa: E402
+from src.train.report import (  # noqa: E402
+    classification_report,
+    confidence_table,
+    write_report,
 )
 
 INFER_COL = "infer"
@@ -70,76 +77,71 @@ def _suppress_progress():
         yield
 
 
-def _model_forward(learn, windows: np.ndarray):
+def _model_forward(learn, windows: np.ndarray, batch_tfms=None):
     """直接对模型 forward 得到概率与类别索引。
 
     绕开 tsai get_X_preds 内部的 vocab 解码（decodes），避免个别模型加载后
     vocab 状态异常导致的 IndexError（vocab[o] 越界）或 reshape 错误。
     模型输出列序 = 训练时 TSClassification 的 vocab（sorted(set(y))）= classes。
+
+    batch_tfms 必须与训练一致：TSStandardize 注册在 DataLoader 的 after_batch
+    管线里，不在 learn.model 内部，故这里先 apply_batch_tfms 复现同一标准化
+    再前向（见 src/train/norm.py），否则训练/推理输入分布不一致。
     """
     import torch
     dev = next(learn.model.parameters()).device
-    x = torch.as_tensor(windows, dtype=torch.float32, device=dev)
+    arr = apply_batch_tfms(windows, batch_tfms)
+    x = torch.as_tensor(arr, dtype=torch.float32, device=dev)
     with torch.no_grad():
         logits = learn.model(x)
     probas = torch.softmax(logits, dim=-1).cpu().numpy()
     return probas, np.argmax(probas, axis=-1)
 
 
-def predict_daily(learn, df: pd.DataFrame, items: list[str],
-                  seq_len: int, start: int | None = None,
-                  end: int | None = None,
-                  class_weights: dict | None = None,
-                  classes: list[str] | None = None,
-                  ) -> tuple[list[str], list[list[float] | None]]:
-    """对整个时间序列批量逐日推理（可只推理 [start, end) 区间）。
+def predict_last_rows(learn, df: pd.DataFrame, items: list[str], seq_len: int,
+                      positions: list[int], batch_tfms=None,
+                      class_weights: dict | None = None,
+                      classes: list[str] | None = None,
+                      ) -> dict[int, tuple[str, list[float] | None]]:
+    """只对给定位置（各验证窗口的末日）批量推理。
 
-    对第 i 天，用其前 seq_len 天（含当天）的特征预测当天标签；
-    无法凑齐历史的天（i < seq_len-1，或 start/end 限定区间之外）标签记为 N、
-    概率为 None。
+    与训练口径完全一致：训练样本的标签取窗口最后一天，因此验证也只在
+    "窗口末日"产生一个样本——用其前 seq_len 天（含当天）的特征预测当天标签，
+    不再对窗口内每一天逐日推理（那会使验证样本数与训练样本密度脱节）。
 
-    start / end：限定逐日推理的日期索引区间 [start, end)，区间外保持 N。
-    用于"裁剪到验证窗口覆盖区间"，避免对整段源序列逐日推理造成浪费。
+    positions：窗口末日在源序列中的行索引集合。
+    历史不足 seq_len 天或越界的位置会被跳过（不产生样本）。
 
     class_weights / classes：决策边界按标签权重调整——probas 乘以权重后
     再取最大类别，使高权重标签（如 T/B）更易被选中（与训练损失加权一致）。
 
-    一次性把所有可推理的逐日窗口组成 batch 直接传给模型 forward，
-    避免逐样本调用导致的进度条刷屏与低吞吐。
+    一次性把所有窗口末日组成 batch 传给模型 forward，避免逐样本调用。
 
-    用 _model_forward 直接计算 softmax 概率（列序 = 训练时 vocab = classes），
-    并按 classes 映射类别索引为标签字符串（如 'T'），绕开 get_X_preds
-    的 vocab 解码，避免个别模型 vocab 状态异常导致的越界 / reshape 错误。
-
-    返回 (infers, probas_list)，长度均为 len(df)。
+    返回 {position: (label, probas)}。
     """
-    n = len(df)
-    infers = ["N"] * n
-    probas_list: list[list[float] | None] = [None] * n
-    i0 = max(seq_len - 1, 0 if start is None else start)
-    i1 = n if end is None else min(n, end)
-    idxs = list(range(i0, i1))
-    if not idxs:
-        return infers, probas_list
-    # 一次性构造所有逐日窗口：(m, vars, seq_len)
+    pos = sorted({int(p) for p in positions
+                  if p is not None and seq_len - 1 <= int(p) < len(df)})
+    if not pos:
+        return {}
+    # 每个末日位置构造一个完整窗口：(m, vars, seq_len)
     windows = np.stack([
         df.iloc[i - seq_len + 1:i + 1][items].to_numpy(dtype=np.float32).T
-        for i in idxs
+        for i in pos
     ])
-    probas, preds_idx = _model_forward(learn, windows)
+    probas, preds_idx = _model_forward(learn, windows, batch_tfms=batch_tfms)
+    out: dict[int, tuple[str, list[float] | None]] = {}
     # 决策边界考虑标签权重：probas 列序 = classes，乘权重后 argmax
     if class_weights and classes:
         w = np.array([float(class_weights.get(c, 1.0)) for c in classes], dtype=float)
         scored = probas * w[None, :]
-        for k, i in enumerate(idxs):
-            infers[i] = str(classes[int(np.argmax(scored[k]))])
-            probas_list[i] = probas[k].tolist()
+        for k, i in enumerate(pos):
+            out[i] = (str(classes[int(np.argmax(scored[k]))]), probas[k].tolist())
     else:
-        for k, i in enumerate(idxs):
+        for k, i in enumerate(pos):
             # 模型输出列序 = classes，按索引映射标签；无 classes 时退回数字索引
-            infers[i] = str(classes[int(preds_idx[k])]) if classes else str(int(preds_idx[k]))
-            probas_list[i] = probas[k].tolist()
-    return infers, probas_list
+            label = str(classes[int(preds_idx[k])]) if classes else str(int(preds_idx[k]))
+            out[i] = (label, probas[k].tolist())
+    return out
 
 
 def _src_path(src_name: str, cfg: dict) -> Path | None:
@@ -227,35 +229,168 @@ def find_manifest(model_path: Path) -> Path:
     return manifest
 
 
-def _append_samples(samples: list[dict], rel: Path, df: pd.DataFrame,
-                    win_infers: list[str],
-                    win_probas: list[list[float] | None],
-                    label: str,
-                    win_confs: list[float | None] | None = None) -> None:
-    """把窗口内逐日样本追加到 samples（true=当天峰值标签，pred=当天推理，conf=标签置信度）。"""
-    for i in range(len(df)):
-        raw = df[label].iloc[i]
-        true_label = str(raw).strip() if pd.notna(raw) else ""
-        if not true_label:
-            true_label = "None"
-        item = {
-            "path": str(rel),
-            "date": str(df[DATE_COL].iloc[i]),
-            "true": true_label,
-            "pred": win_infers[i],
-            "probas": win_probas[i],
-        }
-        if win_confs is not None:
-            item["conf"] = win_confs[i]
-        samples.append(item)
+def _append_last_sample(samples: list[dict], rel: Path, df: pd.DataFrame,
+                        pred: str, probas: list[float] | None, label: str,
+                        conf: float | None = None) -> None:
+    """只把窗口最后一天追加为评估样本（与训练标签口径一致）。
+
+    true = 窗口末日的峰值标签，pred = 同一窗口末日的推理结果。
+    """
+    i = len(df) - 1
+    raw = df[label].iloc[i]
+    true_label = str(raw).strip() if pd.notna(raw) else ""
+    if not true_label:
+        true_label = "None"
+    item = {
+        "path": str(rel),
+        "date": str(df[DATE_COL].iloc[i]),
+        "true": true_label,
+        "pred": pred,
+        "probas": probas,
+    }
+    if conf is not None:
+        item["conf"] = conf
+    samples.append(item)
+
+
+SPLIT_NAMES = {"valid": "验证集（valid）", "test": "测试集（test）"}
+
+
+def split_window_paths(manifest: dict, split: str) -> list[Path]:
+    """从模型清单取指定数据集（valid / test）的窗口路径。
+
+    新清单含 split_paths（train/valid/test）；旧清单只有 valid_paths，
+    此时仅 valid 可用（test 返回空列表）。
+    """
+    split_paths = manifest.get("split_paths") or {}
+    paths = split_paths.get(split)
+    if paths is None and split == "valid":
+        paths = manifest.get("valid_paths") or []
+    return [Path(p) for p in (paths or [])]
+
+
+def evaluate_split(split: str, window_paths: list[Path], learn, manifest: dict,
+                   cfg: dict, items: list[str], seq_len: int,
+                   classes: list[str], batch_tfms, verbose: bool = False,
+                   ) -> tuple[list[dict], int]:
+    """对指定数据集逐窗口末日推理，写 CSV 并返回 (samples, 成功窗口数)。
+
+    输出结构：<validation>/<模型名>/<split>/<源名>/<窗口>.csv（含 infer/conf/P_* 列）
+    """
+    out_root = cfg["validation"] / manifest["model"] / split
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    # 按源股票分组（源名 = 窗口相对 dataset 的第一级目录名）
+    win_by_src: dict[str | None, list[Path]] = defaultdict(list)
+    for p in window_paths:
+        try:
+            src_name = p.relative_to(cfg["dataset"]).parts[0]
+        except ValueError:
+            src_name = None
+        win_by_src[src_name].append(p)
+
+    samples: list[dict] = []
+    ok = 0
+    for src_name, wins in win_by_src.items():
+        try:
+            if src_name is None:
+                raise ValueError("无法定位源股票文件夹")
+            src_full = _src_path(src_name, cfg)
+            if src_full is None:
+                raise FileNotFoundError(f"源文件不存在: {src_full}")
+            df_src = pd.read_csv(src_full, encoding="utf-8-sig")
+            date_to_idx = {str(d): i for i, d in enumerate(df_src[DATE_COL])}
+
+            # 每个窗口只取末日：定位其在源序列中的行索引，一次性批量推理
+            windows_meta: list[tuple[Path, pd.DataFrame, int | None]] = []
+            positions: list[int] = []
+            for w in wins:
+                dw = pd.read_csv(w, encoding="utf-8-sig")
+                g1 = date_to_idx.get(str(dw[DATE_COL].iloc[-1]))
+                windows_meta.append((w, dw, g1))
+                if g1 is not None:
+                    positions.append(g1)
+
+            # 只推理窗口末日（与训练口径一致）
+            pred_by_pos = predict_last_rows(
+                learn, df_src, items, seq_len, positions,
+                batch_tfms=batch_tfms,
+                # 默认 None（纯 argmax）；训练已用加权损失，推理不再重复加权
+                class_weights=(manifest.get("loss_label_weight")
+                               if str(manifest.get("decision_weight", "none")).lower()
+                               == "loss" else None),
+                classes=classes)
+
+            for w, dw, g1 in windows_meta:
+                rel = w.relative_to(cfg["dataset"])
+                n = len(dw)
+                # 只写末行 infer / conf / P_*，其余行留空（训练与评估都只用窗口末日）
+                win_infers: list[str] = [""] * (n - 1) + ["N"]
+                win_probas: list[list[float] | None] = [None] * n
+                pred = pred_by_pos.get(g1) if g1 is not None else None
+                if pred is not None:
+                    win_infers[-1], win_probas[-1] = pred
+                conf = _label_conf(win_probas[-1], win_infers[-1], classes)
+                win_confs: list[float | None] = [None] * (n - 1) + [conf]
+                write_validation_csv(w, out_root / rel, win_infers, confs=win_confs,
+                                     probas_matrix=win_probas, classes=classes)
+                _append_last_sample(samples, rel, dw, win_infers[-1],
+                                    win_probas[-1], cfg["label"], conf=conf)
+                ok += 1
+                if verbose:
+                    logging.debug("[%s] %s -> 末日 %s（infer %s, conf %s）",
+                                  split, w.name, dw[DATE_COL].iloc[-1],
+                                  win_infers[-1], conf)
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("[%s] 源股票 %s 处理失败并跳过：%s", split, src_name, exc)
+    return samples, ok
+
+
+def write_split_reports(split: str, samples: list[dict], classes: list[str],
+                        manifest: dict, cfg: dict) -> list[Path]:
+    """生成该数据集（valid / test）的分类报告，写两份：
+
+    - 模型目录：<models>/<模型名>.<split>.log（用户要求的验证/测试报告）
+    - 验证目录：<validation>/<模型名>/<split>/summary.log
+
+    指标在完整类别空间上计算（不做 true/pred 双向过滤），漏报计入 recall 分母。
+    """
+    y_true = [s["true"] for s in samples]
+    y_pred = [s["pred"] for s in samples]
+    has_probas = bool(samples) and all(s.get("probas") for s in samples)
+    probas = [s["probas"] for s in samples] if has_probas else None
+
+    lines = [
+        f"模型: {manifest['model']}",
+        f"数据集: {SPLIT_NAMES.get(split, split)}",
+        f"生成时间: {datetime.now():%Y-%m-%d %H:%M:%S}",
+        f"类别顺序: {classes}",
+        f"样本数: {len(samples)}",
+        "",
+        "== 分类指标 ==",
+        *classification_report(y_true, y_pred, classes, probas=probas),
+        "",
+        "== 置信度分档（conf = 被预测类别的概率） ==",
+        *(confidence_table(y_true, y_pred, probas, classes)
+          if probas else ["缺少概率矩阵，跳过置信度分档"]),
+    ]
+
+    model_report = cfg["models"] / f"{manifest['model']}.{split}.log"
+    write_report(model_report, lines)
+    summary_path = cfg["validation"] / manifest["model"] / split / SUMMARY_FILE
+    write_report(summary_path, lines)
+    return [model_report, summary_path]
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="tsai 时序分类模型验证（写 infer 列 + 结构化结果）")
+    parser = argparse.ArgumentParser(
+        description="tsai 时序分类模型验证 / 测试（写 infer 列 + 分类报告）")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG,
                         help="配置文件路径（默认: config/classify_train.json）")
     parser.add_argument("--model", type=Path, default=None,
                         help="模型 pkl 路径（默认取 models 目录最新 <label>_<arch>-*.pkl）")
+    parser.add_argument("--split", choices=("valid", "test", "all"), default="all",
+                        help="要评估的数据集：valid=验证集，test=测试集，all=两者（默认）")
     parser.add_argument("-v", "--verbose", action="store_true", help="输出调试日志")
     args = parser.parse_args(argv)
 
@@ -272,123 +407,57 @@ def main(argv: list[str] | None = None) -> int:
     manifest = find_manifest(model_path)
     with open(manifest, "r", encoding="utf-8") as f:
         m = json.load(f)
-    valid_paths = [Path(p) for p in m["valid_paths"]]
     items = m.get("items") or cfg["items"]
     seq_len = int(m.get("seq_len", cfg["seq_len"]))
     classes = m.get("classes") or []
-    logging.info("验证集样本 %d 条，类别顺序 %s", len(valid_paths), classes)
+    # 训练时的 batch_tfms，推理前必须复现（旧模型清单无该字段时回退到当前配置）
+    batch_tfms = m.get("batch_tfms", cfg.get("batch_tfms"))
+    logging.info("类别顺序 %s，batch_tfms: %s，划分比例: %s",
+                 classes, batch_tfms, m.get("split_ratio"))
 
     learn = load_learner(model_path)
 
-    # 输出根目录：validation/<模型名>/
-    out_root = cfg["validation"] / m["model"]
-    out_root.mkdir(parents=True, exist_ok=True)
+    targets = ["valid", "test"] if args.split == "all" else [args.split]
+    total_ok = 0
+    for split in targets:
+        window_paths = split_window_paths(m, split)
+        if not window_paths:
+            logging.warning("模型清单中没有 %s 集样本，跳过"
+                            "（旧模型清单只含 valid_paths，需重新训练）", split)
+            continue
+        logging.info("[%s] 开始评估：%d 个窗口（%s）",
+                     split, len(window_paths), SPLIT_NAMES.get(split, split))
+        samples, ok = evaluate_split(split, window_paths, learn, m, cfg,
+                                    items, seq_len, classes, batch_tfms,
+                                    verbose=args.verbose)
+        if ok == 0:
+            logging.error("[%s] 0 个样本成功，跳过报告生成", split)
+            continue
 
-    # 按源股票分组验证窗口（源名 = 窗口相对 dataset 的第一级目录名）
-    win_by_src: dict[str | None, list[Path]] = defaultdict(list)
-    for p in valid_paths:
-        try:
-            src_name = p.relative_to(cfg["dataset"]).parts[0]
-        except ValueError:
-            src_name = None
-        win_by_src[src_name].append(p)
+        # 结构化结果（供 evaluate.py / 二次分析）
+        results = {
+            "model": m["model"],
+            "split": split,
+            "label": cfg["label"],
+            "classes": classes or sorted({s["true"] for s in samples}
+                                         | {s["pred"] for s in samples}),
+            "samples": samples,
+        }
+        results_path = cfg["validation"] / m["model"] / split / RESULTS_FILE
+        results_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(results_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+        logging.info("[%s] 结构化结果: %s", split, results_path)
 
-    # 源股票逐日推理缓存：src_name -> (infers, probas_list, date_to_idx)
-    # 同一源股票的多个窗口只推理一次，避免重复计算与进度条刷屏
-    daily_cache: dict[str, tuple] = {}
+        reports = write_split_reports(split, samples, results["classes"], m, cfg)
+        for p in reports:
+            logging.info("[%s] 报告已保存: %s", split, p)
+        total_ok += ok
 
-    samples = []
-    ok = 0
-    for src_name, wins in win_by_src.items():
-        try:
-            if src_name is None:
-                raise ValueError("无法定位源股票文件夹")
-            src_full = _src_path(src_name, cfg)
-            if src_full is None:
-                raise FileNotFoundError(f"源文件不存在: {src_full}")
-            df_src = pd.read_csv(src_full, encoding="utf-8-sig")
-            date_to_idx = {str(d): i for i, d in enumerate(df_src[DATE_COL])}
-
-            # 计算推理区间 [start, end)：覆盖所有窗口首日(前推 seq_len-1 天)到末日
-            start: int | None = None
-            end: int | None = None
-            windows_meta: list[tuple[Path, pd.DataFrame]] = []
-            for w in wins:
-                dw = pd.read_csv(w, encoding="utf-8-sig")
-                windows_meta.append((w, dw))
-                g0 = date_to_idx.get(str(dw[DATE_COL].iloc[0]))
-                if g0 is not None:
-                    lo = max(0, g0 - (seq_len - 1))
-                    start = lo if start is None else min(start, lo)
-                g1 = date_to_idx.get(str(dw[DATE_COL].iloc[-1]))
-                if g1 is not None:
-                    end = g1 + 1 if end is None else max(end, g1 + 1)
-
-            # 只对窗口覆盖区间逐日推理，大幅减少推理量（而非整段源序列）
-            infers, probas_list = predict_daily(learn, df_src, items, seq_len,
-                                                start=start, end=end,
-                                                class_weights=m.get("loss_label_weight"),
-                                                classes=classes)
-            daily_cache[src_name] = (infers, probas_list, date_to_idx)
-            n_infer = (end or len(df_src)) - (start or 0)
-            logging.info("源股票 %s 推理区间 [%s, %s)（%d 天 / 源序列 %d 天）",
-                         src_name, start, end, n_infer, len(df_src))
-
-            for w, dw in windows_meta:
-                rel = w.relative_to(cfg["dataset"])
-                dst_csv = out_root / rel
-                win_infers: list[str] = []
-                win_probas: list[list[float] | None] = []
-                for d in dw[DATE_COL]:
-                    g = date_to_idx.get(str(d))
-                    if g is None or g >= len(infers):
-                        win_infers.append("N")
-                        win_probas.append(None)
-                    else:
-                        win_infers.append(infers[g])
-                        win_probas.append(probas_list[g])
-                # 标签置信度：预测标签 infer 对应类别的原始概率
-                win_confs = [_label_conf(win_probas[i], win_infers[i], classes)
-                             for i in range(len(dw))]
-                write_validation_csv(w, dst_csv, win_infers, confs=win_confs,
-                                     probas_matrix=win_probas, classes=classes)
-                _append_samples(samples, rel, dw, win_infers, win_probas,
-                                cfg["label"], win_confs=win_confs)
-                ok += 1
-                if args.verbose:
-                    logging.debug("已验证 %s -> %d 天（infer 示例 %s）",
-                                  w.name, len(win_infers), win_infers[:3])
-        except Exception as exc:  # noqa: BLE001
-            # 源股票处理失败：不做窗口内部退化推理，直接跳过该源股票（记 warning）
-            logging.warning("源股票 %s 验证失败并跳过：%s", src_name, exc)
-
-    if ok == 0:
-        logging.error("验证失败：0 个样本成功")
+    if total_ok == 0:
+        logging.error("没有任何数据集评估成功")
         return 1
-
-    # 结构化验证结果（供 evaluate.py）
-    results = {
-        "model": m["model"],
-        "label": cfg["label"],
-        "classes": classes or sorted({s["true"] for s in samples} | {s["pred"] for s in samples}),
-        "samples": samples,
-    }
-    results_path = out_root / RESULTS_FILE
-    with open(results_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
-    logging.info("结构化结果已保存: %s", results_path)
-
-    # 生成模型评分总结日志（调用 evaluate 模块）
-    from src.train.evaluate import evaluate_results
-    summary_path = out_root / SUMMARY_FILE
-    summary = evaluate_results(results_path,
-                               metrics=cfg["evaluate"],
-                               labels=cfg["evaluate_labels"])
-    with open(summary_path, "w", encoding="utf-8") as f:
-        f.write(summary + "\n")
-    logging.info("评分总结已保存: %s", summary_path)
-
-    logging.info("完成：验证 %d/%d 个样本，输出目录 %s", ok, len(valid_paths), out_root)
+    logging.info("完成：共评估 %d 个窗口，报告位于 %s", total_ok, cfg["models"])
     return 0
 
 

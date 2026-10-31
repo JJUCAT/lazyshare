@@ -9,7 +9,8 @@
     - load_config()          读取 config/classify_train.json 完整配置
     - collect_samples()      从 dataset 读取所有窗口样本，组装 X/y
     - window_last_label()    取窗口最后一天的标签（严格 T/B/N，与逐日推理语义一致）
-    - train_valid_split()    按 seed 随机划分训练/验证集
+    - stratified_split()     按末日标签分层划分 训练/验证/测试（默认 6:2:2）
+    - train_valid_split()    按 seed 随机划分训练/验证集（旧接口，仅保留兼容）
 """
 from __future__ import annotations
 
@@ -64,6 +65,48 @@ def load_config(config_path: Path = DEFAULT_CONFIG) -> dict:
     train_max = int(test_cfg.get("train_max", -1))
     # 损失函数标签权重：{标签: 权重}；None 表示不加权（默认 CrossEntropyLoss）
     loss_label_weight = train_cfg.get("loss_label_weight") or None
+    # 推理决策是否也按 loss_label_weight 对概率加权后再取类别。
+    # 默认 "none"（只用 argmax）：训练已用加权损失把偏置学进模型，推理再乘一次
+    # 等于同一权重生效两次（如 B=10 时会把大量 N/T 强行判成 B）。
+    # 仅在显式配置 "loss" 时沿用旧的二次加权行为。
+    decision_weight = str(train_cfg.get("decision_weight", "none")).strip().lower()
+    if decision_weight not in ("none", "loss"):
+        raise ValueError(f'train.decision_weight 只支持 "none" / "loss"，当前 {decision_weight!r}')
+
+    # 数据集划分比例 (train, valid, test)，默认 6:2:2。
+    # 支持两种写法：{"train":0.6,"valid":0.2,"test":0.2} 或 [0.6,0.2,0.2]；
+    # 缺省时回退到旧配置 validation_set（(1-v, v, 0)）。
+    split_cfg = train_cfg.get("split")
+    if isinstance(split_cfg, (list, tuple)) and len(split_cfg) == 3:
+        split_ratio = tuple(float(x) for x in split_cfg)
+    elif isinstance(split_cfg, dict) and split_cfg:
+        split_ratio = (
+            float(split_cfg.get("train", 0.6)),
+            float(split_cfg.get("valid", 0.2)),
+            float(split_cfg.get("test", 0.2)),
+        )
+    else:
+        _v = float(train_cfg.get("validation_set", 0.1))
+        split_ratio = (1.0 - _v, _v, 0.0)
+    if min(split_ratio) < 0 or abs(sum(split_ratio) - 1.0) > 1e-6:
+        raise ValueError(f"train.split 比例必须非负且和为 1，当前 {split_ratio}")
+
+    # 早停 + 最优权重回滚（train.early_stopping）：
+    #   monitor   : 监控指标名，必须是 fastai recorder 里的指标（valid_loss / accuracy）
+    #   patience  : 连续多少轮无改善就提前终止；0 表示不早停（只做最优权重回滚）
+    #   min_delta : 视为"改善"的最小幅度，过滤平台期的数值抖动
+    # save_best：是否保存并回滚到监控指标最优的权重（独立于早停开关）
+    es_cfg = train_cfg.get("early_stopping") or {}
+    es_monitor = str(es_cfg.get("monitor") or "valid_loss").strip() or "valid_loss"
+    es_patience = int(es_cfg.get("patience", 5))
+    es_min_delta = float(es_cfg.get("min_delta", 0.0))
+    if es_patience < 0:
+        raise ValueError(
+            f"train.early_stopping.patience 必须 >= 0（0 表示不早停），当前 {es_patience}")
+    if es_min_delta < 0:
+        raise ValueError(
+            f"train.early_stopping.min_delta 必须 >= 0，当前 {es_min_delta}")
+    save_best = bool(train_cfg.get("save_best", True))
 
     # 随机种子：显式配置整数则固定可复现；缺省 / null / "auto" / "random"
     # 用当前时间生成随机种子，使每次训练抽样的训练集不同
@@ -101,9 +144,18 @@ def load_config(config_path: Path = DEFAULT_CONFIG) -> dict:
         "epochs": int(train_cfg.get("epochs", 100)),
         "learning_rate": float(train_cfg.get("learning_rate", 0.001)),
         "validation_set": float(train_cfg.get("validation_set", 0.1)),
+        "split_ratio": split_ratio,
         "seed": seed,
         "train_max": train_max,
         "loss_label_weight": loss_label_weight,
+        "decision_weight": decision_weight,
+        # 早停 / 最优权重回滚
+        "early_stopping": {
+            "monitor": es_monitor,
+            "patience": es_patience,
+            "min_delta": es_min_delta,
+        },
+        "save_best": save_best,
         "evaluate": evaluate_items,
         "evaluate_labels": evaluate_labels,
         "accuracy_intervals": accuracy_intervals,
@@ -196,10 +248,58 @@ def collect_samples(dataset_dir: Path, items: list[str], label: str,
     return np.stack(X), np.array(y), paths
 
 
-def train_valid_split(n_samples: int, valid_ratio: float, seed: int):
-    """按 seed 随机划分训练/验证索引。
+def stratified_split(y, ratios=(0.6, 0.2, 0.2), seed: int = 42):
+    """按标签分层划分训练 / 验证 / 测试集。
 
-    返回 (train_idx, valid_idx)，均为升序整数数组。
+    分类任务要求三个集合的类别分布一致，而窗口是按股票时间顺序切出来的，
+    直接整体随机划分会让小类（如 B）在某些集合中缺失或比例漂移。因此在
+    每个类别内部独立按 ratios 切分，再把各类结果合并。
+
+    y      : 样本标签数组（如 ['B','N','T',...]）
+    ratios : (train, valid, test) 比例，之和为 1
+    seed   : 随机种子
+
+    返回 (train_idx, valid_idx, test_idx)，均为升序整数数组，三者互斥且并集为全集。
+    取整误差由 test 段吸收，因此每个类别在三个集合中的占比与全集一致
+    （差异仅来自整数取整，单类别样本量小时最多相差 1 个样本）。
+    """
+    y = np.asarray(y)
+    n = len(y)
+    if n == 0:
+        raise ValueError("stratified_split: 样本为空")
+    r_tr, r_va = float(ratios[0]), float(ratios[1])
+    rng = np.random.default_rng(seed)
+    tr_idx: list[int] = []
+    va_idx: list[int] = []
+    te_idx: list[int] = []
+    for cls in sorted(set(y.tolist())):
+        cls_idx = np.flatnonzero(y == cls)
+        rng.shuffle(cls_idx)  # 类别内打乱，保证随机性
+        m = len(cls_idx)
+        n_tr = int(round(m * r_tr))
+        n_va = int(round(m * r_va))
+        # 防止四舍五入导致超出，剩余全部归入 test
+        n_tr = min(n_tr, m)
+        n_va = min(n_va, m - n_tr)
+        tr_idx.extend(cls_idx[:n_tr].tolist())
+        va_idx.extend(cls_idx[n_tr:n_tr + n_va].tolist())
+        te_idx.extend(cls_idx[n_tr + n_va:].tolist())
+    return (np.sort(np.asarray(tr_idx, dtype=int)),
+            np.sort(np.asarray(va_idx, dtype=int)),
+            np.sort(np.asarray(te_idx, dtype=int)))
+
+
+def label_counts(y, indices) -> dict[str, int]:
+    """统计给定索引集合上的标签分布（按标签名排序）。"""
+    y = np.asarray(y)
+    sub = y[np.asarray(indices, dtype=int)] if len(indices) else np.asarray([])
+    return {c: int((sub == c).sum()) for c in sorted(set(y.tolist()))}
+
+
+def train_valid_split(n_samples: int, valid_ratio: float, seed: int):
+    """按 seed 随机划分训练/验证索引（旧接口，保留兼容）。
+
+    新流程请使用 stratified_split()，它额外产出测试集并保证类别比例一致。
     """
     rng = np.random.default_rng(seed)
     idx = rng.permutation(n_samples)
