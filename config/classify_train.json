@@ -3,10 +3,13 @@
     "seq_len": 42,
     "jump_step": 42,
     "items": [
+      "LU",
       "NC",
       "NV",
-      "NA",
-      "SNB",
+      "ATR",
+      "NBull",
+      "NBear",
+      "TR",
       "IMV",
       "SIV"
     ],

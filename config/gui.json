@@ -29,11 +29,11 @@
       {
         "series": [
           {
-            "column": "NA",
+            "column": "ATR",
             "side": "left"
           },
           {
-            "column": "SNB",
+            "column": "TR",
             "side": "right"
           }
         ]

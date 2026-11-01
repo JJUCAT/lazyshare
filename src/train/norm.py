@@ -4,7 +4,7 @@
 背景：训练时 `TSClassifier(batch_tfms=...)` 的变换注册在 DataLoader 的
 after_batch 管线里，**不在 `learn.model` 内部**。因此 verify / predict 用
 `learn.model(x)` 直接前向时，必须手动应用同一变换，否则模型在训练阶段
-看到的是标准化后的张量，推理阶段却是原始特征（NC/NV/NA 与 IMV/SIV
+看到的是标准化后的张量，推理阶段却是原始特征（NC/NV/ATR 与 IMV/SIV
 量级相差两个数量级），预测结果系统性偏移。
 
 本模块仅实现 config 允许的两种取值：

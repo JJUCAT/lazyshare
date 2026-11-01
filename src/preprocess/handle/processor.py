@@ -26,9 +26,11 @@ from .indicators import (
     COL_NAME,
     COL_VOLUME,
     FLOAT_COLUMNS,
+    FLOAT_DECIMALS,
+    IPO_SKIP_DAYS,
     OUTPUT_COLUMNS,
     compute_indicators,
-    is_st_stock,
+    is_skipped_stock,
     sanitize_filename,
 )
 from .weather import EMPTY_WEATHER, compute_imv_siv, load_weather
@@ -112,12 +114,12 @@ def process_file(task: tuple[Path, Path]) -> dict:
     name = str(name_raw).strip() if not pd.isna(name_raw) else ""
     industry = str(industry_raw).strip() if not pd.isna(industry_raw) else ""
 
-    # ST 股票跳过，不生成预处理数据文件
-    if is_st_stock(df):
+    # ST / *ST / 退市股票跳过，不生成预处理数据文件
+    if is_skipped_stock(df):
         return {"status": "st_skip", "code": code, "name": name,
-                "message": "ST 股票"}
+                "message": "ST/*ST/退市 股票"}
 
-    ind = compute_indicators(df)
+    ind = compute_indicators(df, code)
 
     # IMV：行业成交量 / 大盘成交量；SIV：个股成交量 / 行业成交量（基于 weather.csv）
     imv, siv = compute_imv_siv(df, _WEATHER if _WEATHER is not None else EMPTY_WEATHER)
@@ -133,25 +135,25 @@ def process_file(task: tuple[Path, Path]) -> dict:
             "行业": industry,
             "收盘价": ind["close"],
             "成交量": ind["volume"],
+            "LU": ind["lu"],
             "M21C": ind["m21c"],
             "M21V": ind["m21v"],
             "NC": ind["nc"],
             "NV": ind["nv"],
-            "NA": ind["na"],
-            "NBear": ind["nbear"],
+            "ATR": ind["atr"],
             "NBull": ind["nbull"],
-            "SNC": ind["snc"],
-            "SNV": ind["snv"],
-            "SNB": ind["snb"],
-            "M21SNB": ind["m21snb"],
+            "NBear": ind["nbear"],
+            "TR": ind["tr"],
             "IMV": imv,
             "SIV": siv,
             "峰值标签": peak_labels,
         }
     )
+    # 跳过上市前 IPO_SKIP_DAYS 个交易日（该区间涨跌幅无限制，LU 无意义）
+    out = out.iloc[IPO_SKIP_DAYS:].reset_index(drop=True)
     result = out[OUTPUT_COLUMNS].copy()
-    # 浮点数最多保留 3 位小数
-    result[FLOAT_COLUMNS] = result[FLOAT_COLUMNS].round(3)
+    # 浮点数最多保留 FLOAT_DECIMALS 位小数
+    result[FLOAT_COLUMNS] = result[FLOAT_COLUMNS].round(FLOAT_DECIMALS)
     result.to_csv(tmp_path, index=False, encoding="utf-8-sig")
     return {"status": "ok", "code": code, "name": name, "message": None}
 
@@ -196,8 +198,8 @@ def needs_update(raw_file: Path, out_dir: Path) -> bool:
         return False
     if not code or not raw_dates:
         return False
-    # ST 股票不生成预处理文件，无需更新
-    if "ST" in last_name.upper() or last_st_flag:
+    # ST / *ST / 退市股票不生成预处理文件，无需更新
+    if "ST" in last_name.upper() or "退" in last_name or last_st_flag:
         return False
 
     # 按代码匹配输出文件（名称可能变化）
@@ -217,8 +219,8 @@ def needs_update(raw_file: Path, out_dir: Path) -> bool:
                 di = header.index("日期")
             except ValueError:
                 return True
-            # 旧输出缺少 IMV/SIV 列时也需重新生成（列结构升级）
-            if "IMV" not in header or "SIV" not in header:
+            # 列结构（新增 LU/ATR/TR、移除 NA/SNC/SNV/SNB/M21SNB）变化时需重新生成
+            if list(header) != list(OUTPUT_COLUMNS):
                 return True
             for row in reader:
                 if len(row) > di:
