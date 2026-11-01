@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import logging
 import os
 import re
@@ -14,7 +15,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from ..label.peak import compute_peak_labels
+from ..label.triple_barrier import compute_triple_barrier_labels
 from .config import DEFAULT_CONFIG, PROJECT_ROOT, load_config
 from .indicators import (
     COL_CLOSE,
@@ -45,11 +46,15 @@ _STOCK_FILE_RE = re.compile(r"^\d{6}[-_]")
 # weather.csv 查询表（由进程池 worker 经 initializer 加载一次，供 IMV/SIV 计算）
 _WEATHER: dict | None = None
 
+# 三元屏蔽标签配置（由进程池 worker 经 initializer 加载一次）
+_LABEL_CFG: dict | None = None
 
-def _init_worker(weather_path: str | None) -> None:
-    """进程池 worker 初始化：加载 weather.csv 查询表。"""
-    global _WEATHER
+
+def _init_worker(weather_path: str | None, label_cfg: dict | None = None) -> None:
+    """进程池 worker 初始化：加载 weather.csv 查询表与 label（三元屏蔽）配置。"""
+    global _WEATHER, _LABEL_CFG
     _WEATHER = load_weather(weather_path) if weather_path else None
+    _LABEL_CFG = label_cfg
 
 
 def setup_logging(log_file: Path = LOG_FILE, verbose: bool = False) -> None:
@@ -91,9 +96,13 @@ def process_file(task: tuple[Path, Path]) -> dict:
         return {"status": "empty", "code": None, "name": None,
                 "message": "空文件"}
 
+    # 三元屏蔽（止盈 / 止损 / 时限）标签配置；worker 未初始化时退回默认值
+    label_cfg = _LABEL_CFG or {}
+    price_col = str(label_cfg.get("price") or "开盘价")
+
     # 必要列校验（防止 weather.csv 等非股票文件导致任务整体崩溃）
     _REQUIRED_COLS = (COL_DATE, COL_CODE, COL_NAME, COL_INDUSTRY,
-                      COL_CLOSE, COL_HIGH, COL_LOW, COL_VOLUME)
+                      COL_CLOSE, COL_HIGH, COL_LOW, COL_VOLUME, price_col)
     missing = [c for c in _REQUIRED_COLS if c not in df.columns]
     if missing:
         return {"status": "error", "code": None, "name": None,
@@ -124,8 +133,12 @@ def process_file(task: tuple[Path, Path]) -> dict:
     # IMV：行业成交量 / 大盘成交量；SIV：个股成交量 / 行业成交量（基于 weather.csv）
     imv, siv = compute_imv_siv(df, _WEATHER if _WEATHER is not None else EMPTY_WEATHER)
 
-    # 峰值标签：T（高峰）/ B（低谷）/ N（None）（标签计算在 src/preprocess/label）
-    peak_labels = compute_peak_labels(ind["close"], ind["m21c"])
+    # 三元屏蔽标签：止盈（默认 T）/ 止损（默认 B）/ 时限无操作（默认 N）
+    # 逐日向前看 label.max_days 个交易日，按 label.price（默认开盘价）计算收益
+    labels = compute_triple_barrier_labels(
+        pd.to_numeric(df[price_col], errors="coerce").to_numpy(dtype=float),
+        label_cfg,
+    )
 
     out = pd.DataFrame(
         {
@@ -146,11 +159,16 @@ def process_file(task: tuple[Path, Path]) -> dict:
             "TR": ind["tr"],
             "IMV": imv,
             "SIV": siv,
-            "峰值标签": peak_labels,
+            "峰值标签": labels,
         }
     )
+    # 丢弃末尾 label.max_days 行：其前瞻窗口不完整，标签为空（无法判定三元屏障）
+    out = out[out["峰值标签"].astype(str).str.strip() != ""].reset_index(drop=True)
     # 跳过上市前 IPO_SKIP_DAYS 个交易日（该区间涨跌幅无限制，LU 无意义）
     out = out.iloc[IPO_SKIP_DAYS:].reset_index(drop=True)
+    if out.empty:
+        return {"status": "empty", "code": code, "name": name,
+                "message": "有效数据不足（上市天数或前瞻窗口不够）"}
     result = out[OUTPUT_COLUMNS].copy()
     # 浮点数最多保留 FLOAT_DECIMALS 位小数
     result[FLOAT_COLUMNS] = result[FLOAT_COLUMNS].round(FLOAT_DECIMALS)
@@ -158,15 +176,18 @@ def process_file(task: tuple[Path, Path]) -> dict:
     return {"status": "ok", "code": code, "name": name, "message": None}
 
 
-def needs_update(raw_file: Path, out_dir: Path) -> bool:
+def needs_update(raw_file: Path, out_dir: Path, max_days: int = 0) -> bool:
     """判断原始文件是否需要重新生成预处理输出（增量更新）。
 
     - ST 股票不生成输出，无需更新
     - 输出文件不存在 → 需要（新股票）
     - 输出文件缺少原始数据中的任意日期 → 需要
     - 输出文件已包含原始数据全部日期 → 无需
+
+    max_days：三元屏蔽标签的观察天数。原始数据末尾 max_days 个交易日的前瞻
+    窗口不完整，预处理会丢弃这些行，因此比对时不计入（否则永远判定"需要更新"）。
     """
-    raw_dates: set[str] = set()
+    raw_dates: list[str] = []
     code = name = ""
     last_name = ""
     last_st_flag = False
@@ -189,7 +210,7 @@ def needs_update(raw_file: Path, out_dir: Path) -> bool:
                 if not code:
                     code = row[ci].strip()
                     name = row[ni].strip()
-                raw_dates.add(row[di])
+                raw_dates.append(row[di])
                 if len(row) > ni:
                     last_name = row[ni].strip()
                 if st_idx >= 0 and len(row) > st_idx:
@@ -227,7 +248,42 @@ def needs_update(raw_file: Path, out_dir: Path) -> bool:
                     out_dates.add(row[di])
     except OSError:
         return True
-    return not raw_dates.issubset(out_dates)
+    # 末尾 max_days 天的前瞻窗口不完整，预处理本就会丢弃，不参与比对
+    expected = raw_dates[: len(raw_dates) - max_days] if max_days > 0 else raw_dates
+    return not set(expected).issubset(out_dates)
+
+
+# label 配置指纹文件：写入 out_dir，配置变化时整体清理旧预处理文件
+LABEL_SIG_FILE = ".label_signature.json"
+
+
+def ensure_label_signature(out_dir: Path, label_cfg: dict) -> int:
+    """校验 out_dir 内的 label 配置指纹，不匹配时清理旧预处理文件。
+
+    三元屏蔽标签依赖 label 段（观察天数 / 止盈 / 止损 / 取值），参数一变，
+    旧输出里的"峰值标签"列全部失效。此处在处理前比对指纹：不一致则删除
+    out_dir 下所有 *.csv（保留子目录如 tasks），由本次运行重新生成。
+    返回清理的文件数量。
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sig_path = out_dir / LABEL_SIG_FILE
+    cur = None
+    if sig_path.exists():
+        try:
+            cur = json.loads(sig_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            cur = None
+    if cur == label_cfg:
+        return 0
+    removed = 0
+    for p in out_dir.glob("*.csv"):
+        p.unlink(missing_ok=True)
+        removed += 1
+    sig_path.write_text(
+        json.dumps(label_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    if removed:
+        logging.warning("label 配置变化：清理旧预处理文件 %d 个，重新生成", removed)
+    return removed
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -255,6 +311,11 @@ def main(argv: list[str] | None = None) -> int:
     raw_dir: Path = cfg["raw_dir"]
     out_dir: Path = cfg["out_dir"]
     weather_path: Path | None = cfg["weather"]
+    label_cfg: dict = cfg["label"]
+
+    # label 配置变化 → 旧预处理输出（标签列）失效，先整体清理
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ensure_label_signature(out_dir, label_cfg)
 
     raw_files = sorted(raw_dir.glob("*.csv"))
     # 仅处理股票数据文件（代码-名称.csv），排除 weather.csv 等非股票文件
@@ -264,7 +325,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.update:
         before = len(raw_files)
-        raw_files = [f for f in raw_files if needs_update(f, out_dir)]
+        raw_files = [f for f in raw_files
+                     if needs_update(f, out_dir, label_cfg["max_days"])]
         logging.info("update 模式：共 %d 个原始文件，%d 个需要更新",
                      before, len(raw_files))
 
@@ -279,6 +341,14 @@ def main(argv: list[str] | None = None) -> int:
         logging.warning("weather.csv 不存在，IMV/SIV 列将为空白: %s", weather_path)
     logging.info("并行 worker 数量: %d（CPU 核心数: %s）",
                  n_workers, os.cpu_count())
+    logging.info(
+        "三元屏蔽标签: max_days=%d, price=%s, take_profit=%s→%s, "
+        "stop_loss=%s→%s, timeout→%s, same_day_priority=%s",
+        label_cfg["max_days"], label_cfg["price"],
+        label_cfg["take_profit"], label_cfg["values"]["take_profit"],
+        label_cfg["stop_loss"], label_cfg["values"]["stop_loss"],
+        label_cfg["values"]["timeout"], label_cfg["same_day_priority"],
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # 清理历史遗留的临时文件
@@ -300,7 +370,8 @@ def main(argv: list[str] | None = None) -> int:
         else None
     )
     with ProcessPoolExecutor(
-        max_workers=n_workers, initializer=_init_worker, initargs=(weather_arg,)
+        max_workers=n_workers, initializer=_init_worker,
+        initargs=(weather_arg, label_cfg),
     ) as executor:
         # map 保持输入顺序
         for i, result in enumerate(executor.map(process_file, tasks, chunksize=1)):

@@ -28,6 +28,9 @@
        - B 日到 T 日相差 <= income_filter.time 个时间节点，
        - 收盘价从 B 日到 T 日涨幅 >= income_filter.increase，
        则该窗口样本被删除。收盘价只用于切片时判定，不写入窗口 csv。
+       注意：该滤波器是为旧的"峰值标注"设计的（B=低谷、T=高峰）。改为
+       三元屏蔽标签后，T/B 表示"未来止盈/止损"，B→T 组合不再代表"低买高卖"，
+       因此 config/classify_train.json 默认不再配置 income_filter（不启用）。
 
 用法：
     python3 scripts/tsai/slice.py [--config config/classify_train.json] [--limit N] [--workers N]

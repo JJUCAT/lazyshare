@@ -7,10 +7,18 @@
 
 提供：
     - load_config()          读取 config/classify_train.json 完整配置
-    - collect_samples()      从 dataset 读取所有窗口样本，组装 X/y
+    - collect_samples()      从 dataset 读取所有窗口样本，组装 X/y/时间跨度
     - window_last_label()    取窗口最后一天的标签（严格 T/B/N，与逐日推理语义一致）
-    - stratified_split()     按末日标签分层划分 训练/验证/测试（默认 6:2:2）
+    - time_split()           按窗口时间顺序划分 训练/验证/测试（严格 train<valid<test）
+    - stratified_split()     按末日标签分层划分（旧接口，仅保留兼容）
     - train_valid_split()    按 seed 随机划分训练/验证集（旧接口，仅保留兼容）
+
+数据划分的核心约束（防止未来数据泄漏）：
+    1. 切片窗口本身不重叠（见 slice.py：jump_step >= seq_len）；
+    2. 三集合按时间切成连续的三段，训练最早、测试最新，窗口时间区间互不相交；
+    3. 三元屏蔽标签会向前看 label.max_days 个交易日，因此相邻集合之间再留出
+       purge 间隔（train.purge_days，默认 21 个交易日 ≈ 31 个日历日），保证
+       训练集标签的前瞻窗口不会跨进验证集、验证集不会跨进测试集。
 """
 from __future__ import annotations
 
@@ -108,6 +116,14 @@ def load_config(config_path: Path = DEFAULT_CONFIG) -> dict:
             f"train.early_stopping.min_delta 必须 >= 0，当前 {es_min_delta}")
     save_best = bool(train_cfg.get("save_best", True))
 
+    # purge 间隔：按时间切分训练/验证/测试时，边界两侧要空出的交易日数。
+    # 三元屏蔽标签会向前看 label.max_days 个交易日，若不留间隔，紧邻边界的
+    # 训练样本标签会用到验证集（乃至测试集）区间的价格，造成未来数据泄漏。
+    # 默认 21（与 config/preprocess.json 的 label.max_days 一致）。
+    purge_days = int(train_cfg.get("purge_days", 21))
+    if purge_days < 0:
+        raise ValueError(f"train.purge_days 必须 >= 0，当前 {purge_days}")
+
     # 随机种子：显式配置整数则固定可复现；缺省 / null / "auto" / "random"
     # 用当前时间生成随机种子，使每次训练抽样的训练集不同
     seed_cfg = train_cfg.get("seed", "auto")
@@ -155,6 +171,7 @@ def load_config(config_path: Path = DEFAULT_CONFIG) -> dict:
             "patience": es_patience,
             "min_delta": es_min_delta,
         },
+        "purge_days": purge_days,
         "save_best": save_best,
         "evaluate": evaluate_items,
         "evaluate_labels": evaluate_labels,
@@ -200,17 +217,19 @@ def collect_samples(dataset_dir: Path, items: list[str], label: str,
                     seq_len: int, max_samples: int | None = None,
                     max_dirs: int | None = None,
                     train_max: int | None = None, seed: int = 42,
-                    ) -> tuple[np.ndarray, np.ndarray, list[Path]]:
+                    ) -> tuple[np.ndarray, np.ndarray, list[Path], np.ndarray]:
     """从 dataset 读取窗口样本。
 
     - train_max >= 0：随机抽取 train_max 个样本作为总训练源（测试用）
     - train_max < 0  或 None：使用 dataset 完整数据
     - max_samples / max_dirs：调试用上限
 
-    返回 (X, y, paths)：
+    返回 (X, y, paths, spans)：
         X    : float32 数组 (n_samples, n_vars, seq_len)
         y    : 字符串标签数组 (n_samples,)
         paths: 每个样本对应的窗口 csv 路径
+        spans: datetime64[D] 数组 (n_samples, 2)，每行 = (窗口首日, 窗口末日)，
+               供 time_split() 按时间顺序划分数据集（日期无法解析的样本被跳过）
     """
     all_paths = _collect_paths(dataset_dir, max_dirs=max_dirs)
     if not all_paths:
@@ -224,8 +243,9 @@ def collect_samples(dataset_dir: Path, items: list[str], label: str,
         # train_max 大于等于样本总数时直接用全部
         logging.info("train_max=%d：随机抽取 %d 个样本作为总训练源", train_max, len(all_paths))
 
-    X, y, paths = [], [], []
+    X, y, paths, spans = [], [], [], []
     n = 0
+    bad_date = 0
     for csv_path in all_paths:
         if max_samples is not None and n >= max_samples:
             break
@@ -236,20 +256,134 @@ def collect_samples(dataset_dir: Path, items: list[str], label: str,
             continue
         if df.empty or len(df) < seq_len:
             continue
+        # 窗口时间跨度：首日 / 末日（用于按时间顺序划分数据集）
+        dates = pd.to_datetime(df[DATE_COL].head(seq_len), errors="coerce")
+        start, end = dates.iloc[0], dates.iloc[-1]
+        if pd.isna(start) or pd.isna(end):
+            bad_date += 1
+            continue
         x = df[items].head(seq_len).to_numpy(dtype=np.float32).T  # (vars, seq_len)
         # 训练标签严格取窗口最后一天（第 seq_len 行）的峰值标签
         y.append(window_last_label(df, label, seq_len))
         X.append(x)
         paths.append(csv_path)
+        spans.append((start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")))
         n += 1
 
+    if bad_date:
+        logging.warning("跳过 %d 个窗口样本：日期无法解析（无法参与时间划分）", bad_date)
     if n == 0:
         raise ValueError(f"dataset 目录下未读取到任何样本: {dataset_dir}")
-    return np.stack(X), np.array(y), paths
+    span_arr = np.array(spans, dtype="datetime64[D]")
+    return np.stack(X), np.array(y), paths, span_arr
+
+
+def span_range(spans, indices) -> tuple[str, str]:
+    """返回给定样本索引集合覆盖的时间范围（最早窗口首日 ~ 最晚窗口末日）。"""
+    spans = np.asarray(spans, dtype="datetime64[D]")
+    idx = np.asarray(list(indices), dtype=int)
+    if len(idx) == 0:
+        return "-", "-"
+    return (str(spans[idx, 0].min()), str(spans[idx, 1].max()))
+
+
+def decision_range(spans, indices) -> tuple[str, str]:
+    """返回给定样本索引集合的决策日范围（最早 ~ 最晚窗口末日）。
+
+    窗口末日是标签锚点，也是 time_split 排序与 purge 的依据；长停牌股票的
+    42 个交易日可能跨很久的日历时间，因此"特征首日"区间会互相重叠，
+    真正严格有序的是这里返回的决策日区间。
+    """
+    spans = np.asarray(spans, dtype="datetime64[D]")
+    idx = np.asarray(list(indices), dtype=int)
+    if len(idx) == 0:
+        return "-", "-"
+    return (str(spans[idx, 1].min()), str(spans[idx, 1].max()))
+
+
+def time_split(spans, ratios=(0.6, 0.2, 0.2), purge_days: int = 21):
+    """按窗口时间顺序划分训练 / 验证 / 测试集（严格 train < valid < test）。
+
+    与 stratified_split（随机分层）的区别：本函数只在时间轴上切三刀，
+    测试集永远是时间最新的一段，训练集是最早的一段。这样验证/测试指标
+    反映的是"用历史预测未来"，而不是"用未来预测过去 + 同一时期随机抽检"。
+
+    spans      : (n, 2) datetime64 数组，每行 = (窗口首日, 窗口末日)
+    ratios     : (train, valid, test) 样本占比，之和为 1
+    purge_days : 相邻集合之间要空出的交易日数（= 三元屏蔽标签的前瞻天数）。
+                 交易日到日历日按 7/5 保守换算并额外 +1 天。
+                 判据是"窗口末日"（= 决策日、标签锚点）：只丢弃那些
+                 标签前瞻窗口（末日 + purge_days 个交易日）会越过下一个集合
+                 最早决策日的样本；其余样本一律保留，不做无谓裁剪。
+
+    返回 (train_idx, valid_idx, test_idx, info)：
+        info = {"purged": 边界处丢弃的样本数, "gap_days": 实际间隔日历天数,
+                "train_span"/"valid_span"/"test_span": (首日, 末日)}
+    并做严格校验：任一集合为空、或"集合内最晚窗口末日 + purge"不早于下一个
+    集合的最早窗口末日（即标签前瞻跨集合）都会抛错。
+    """
+    spans = np.asarray(spans, dtype="datetime64[D]")
+    if spans.ndim != 2 or spans.shape[1] != 2:
+        raise ValueError(f"spans 需为 (n, 2) 数组，实际 {spans.shape}")
+    n = len(spans)
+    if n == 0:
+        raise ValueError("time_split: 样本为空")
+    if min(ratios) < 0 or abs(sum(ratios) - 1.0) > 1e-6:
+        raise ValueError(f"划分比例必须非负且和为 1，当前 {ratios}")
+
+    starts, ends = spans[:, 0], spans[:, 1]
+    # 按窗口末日排序 → 时间上连续切三段（窗口本身不重叠，见 slice.py）
+    order = np.argsort(ends, kind="stable")
+    n_tr = int(round(n * float(ratios[0])))
+    n_va = int(round(n * float(ratios[1])))
+    n_tr = min(max(n_tr, 0), n)
+    n_va = min(max(n_va, 0), n - n_tr)
+    tr = order[:n_tr]
+    va = order[n_tr:n_tr + n_va]
+    te = order[n_tr + n_va:]
+
+    info = {"purged": 0, "gap_days": 0}
+    # 交易日 → 日历日：每周 5 个交易日 ≈ 7 个日历日，再留 1 天余量
+    gap = (np.timedelta64(int(np.ceil(purge_days * 7 / 5)) + 1, "D")
+           if purge_days > 0 else np.timedelta64(0, "D"))
+    info["gap_days"] = int(gap.astype("timedelta64[D]").astype(int))
+    if purge_days > 0:
+        # 只裁掉"标签前瞻会越过下一集合最早决策日"的样本（其余保留，避免无谓丢数据）
+        if len(tr) and len(va):
+            keep = (ends[tr] + gap) < ends[va].min()
+            info["purged"] += int((~keep).sum())
+            tr = tr[keep]
+        if len(va) and len(te):
+            keep = (ends[va] + gap) < ends[te].min()
+            info["purged"] += int((~keep).sum())
+            va = va[keep]
+
+    if not len(tr) or not len(va) or not len(te):
+        raise ValueError(
+            f"time_split: 划分后存在空集合（train {len(tr)} / valid {len(va)} / "
+            f"test {len(te)}），请增大数据量或调整 proportions / purge_days")
+    # 严格校验：上一集合的"末日 + purge"必须早于下一集合的最早末日（标签锚点），
+    # 否则训练标签会用到下一集合期间的行情（未来数据泄漏）
+    for a, b, name_a, name_b in ((tr, va, "train", "valid"),
+                                 (va, te, "valid", "test")):
+        horizon_end, first_b = ends[a].max() + gap, ends[b].min()
+        if not horizon_end < first_b:
+            raise ValueError(
+                f"time_split: {name_a} 标签前瞻末 {horizon_end} 不早于 "
+                f"{name_b} 最早决策日 {first_b}，时间顺序被破坏（未来数据泄漏）")
+        if ends[a].max() >= starts[b].min():
+            logging.debug("time_split: %s 末 %s 与 %s 最早窗口首日 %s 有日历重叠"
+                          "（不同股票、或同一股票不重叠的相邻窗口，属正常横截面）",
+                          name_a, ends[a].max(), name_b, starts[b].min())
+
+    info["train_span"] = span_range(spans, tr)
+    info["valid_span"] = span_range(spans, va)
+    info["test_span"] = span_range(spans, te)
+    return np.sort(tr), np.sort(va), np.sort(te), info
 
 
 def stratified_split(y, ratios=(0.6, 0.2, 0.2), seed: int = 42):
-    """按标签分层划分训练 / 验证 / 测试集。
+    """按标签分层划分训练 / 验证 / 测试集（旧接口，当前流程改用 time_split）。
 
     分类任务要求三个集合的类别分布一致，而窗口是按股票时间顺序切出来的，
     直接整体随机划分会让小类（如 B）在某些集合中缺失或比例漂移。因此在

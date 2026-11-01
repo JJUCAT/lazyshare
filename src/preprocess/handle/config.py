@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
-"""配置加载：读取 config/preprocess.json 的 raw_data 与 preprocessed_data。"""
+"""配置加载：读取 config/preprocess.json 的 raw_data / preprocessed_data / label。"""
 from __future__ import annotations
 
 import json
 from pathlib import Path
+
+from ..label.triple_barrier import normalize_label_config
 
 # src/preprocess/handle/config.py -> handle -> preprocess -> src -> 项目根目录
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -11,7 +13,10 @@ DEFAULT_CONFIG = PROJECT_ROOT / "config" / "preprocess.json"
 
 
 def load_config(config_path: Path = DEFAULT_CONFIG) -> dict:
-    """返回 {"raw_dir", "out_dir", "weather"}，路径不存在时抛异常。"""
+    """返回 {"raw_dir", "out_dir", "weather", "label"}，路径不存在时抛异常。
+
+    label 为三元屏蔽（止盈 / 止损 / 时限）配置，见 preprocess_plan.md。
+    """
     config_path = Path(config_path)
     if not config_path.exists():
         raise FileNotFoundError(f"配置文件不存在: {config_path}")
@@ -25,4 +30,10 @@ def load_config(config_path: Path = DEFAULT_CONFIG) -> dict:
         raise ValueError("preprocessed_data 未配置")
     weather_cfg = cfg.get("weather", "")
     weather_path = Path(weather_cfg).expanduser() if weather_cfg else None
-    return {"raw_dir": raw_dir, "out_dir": out_dir, "weather": weather_path}
+    label_cfg = normalize_label_config(cfg.get("label"))
+    return {
+        "raw_dir": raw_dir,
+        "out_dir": out_dir,
+        "weather": weather_path,
+        "label": label_cfg,
+    }

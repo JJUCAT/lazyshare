@@ -34,9 +34,11 @@ import numpy as np  # noqa: E402
 from src.train.data import (  # noqa: E402
     DEFAULT_CONFIG,
     collect_samples,
+    decision_range,
     label_counts,
     load_config,
-    stratified_split,
+    span_range,
+    time_split,
 )
 from src.train.report import split_table, write_report  # noqa: E402
 
@@ -209,7 +211,7 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.info("读取样本: dataset=%s (limit=%s, dirs=%s, train_max=%s)",
                  cfg["dataset"], args.limit, args.dirs, cfg["train_max"])
-    X, y, paths = collect_samples(
+    X, y, paths, spans = collect_samples(
         cfg["dataset"], cfg["items"], cfg["label"], cfg["seq_len"],
         max_samples=args.limit, max_dirs=args.dirs,
         train_max=cfg["train_max"], seed=cfg["seed"],
@@ -220,19 +222,30 @@ def main(argv: list[str] | None = None) -> int:
     logging.info("标签分布: %s",
                  {k: int((y == k).sum()) for k in sorted(set(y.tolist()))})
 
-    # 按末日标签分层划分 训练/验证/测试（默认 6:2:2）：
-    # 在每个类别内部独立切分，保证三个集合的 T/B/N 占比与全集一致
-    train_idx, valid_idx, test_idx = stratified_split(
-        y, cfg["split_ratio"], cfg["seed"])
+    # 按窗口时间顺序划分 训练/验证/测试（严格 训练 < 验证 < 测试，测试时间最新）：
+    # 时间轴连续切三段，边界处按 purge_days 丢弃样本，避免三元屏蔽标签的前瞻
+    # 窗口跨进下一个集合（未来数据泄漏，见 src/train/data.py time_split）。
+    train_idx, valid_idx, test_idx, split_info = time_split(
+        spans, cfg["split_ratio"], cfg["purge_days"])
     split_indices = {"train": train_idx, "valid": valid_idx, "test": test_idx}
     split_paths = {name: [str(paths[i]) for i in idx]
                    for name, idx in split_indices.items()}
     split_stats = {name: label_counts(y, idx) for name, idx in split_indices.items()}
-    logging.info("分层划分 %s: 训练 %d，验证 %d，测试 %d",
+    # 窗口特征区间（可能因长停牌而互相重叠）与决策日区间（窗口末日，严格有序）
+    split_ranges = {name: list(span_range(spans, idx))
+                    for name, idx in split_indices.items()}
+    split_decision = {name: list(decision_range(spans, idx))
+                      for name, idx in split_indices.items()}
+    logging.info("按时间划分 %s: 训练 %d，验证 %d，测试 %d"
+                 "（purge %d 个交易日，仅丢弃标签前瞻跨集合的 %d 个样本）",
                  "/".join(f"{r:g}" for r in cfg["split_ratio"]),
-                 len(train_idx), len(valid_idx), len(test_idx))
-    for _name, _st in split_stats.items():
-        logging.info("  %-5s 标签分布: %s", _name, _st)
+                 len(train_idx), len(valid_idx), len(test_idx),
+                 cfg["purge_days"], split_info["purged"])
+    for _name in ("train", "valid", "test"):
+        _st = split_stats[_name]
+        _dec = split_decision[_name]
+        logging.info("  %-5s 决策日 %s ~ %s  标签分布: %s",
+                     _name, _dec[0], _dec[1], _st)
 
     clf = build_ts_classifier(X, y, train_idx, valid_idx, cfg)
 
@@ -301,8 +314,15 @@ def main(argv: list[str] | None = None) -> int:
         "trained_epochs": trained_epochs,
         "stopped_early": stopped_early,
         "rolled_back_to_best": rolled_back,
-        # 分层划分比例与三集合的窗口清单 / 标签分布（6:2:2，类别比例一致）
+        # 按时间划分（训练 < 验证 < 测试，测试集时间最新）的比例 / 时间范围 /
+        # 窗口清单 / 标签分布；purge_days 为边界两侧空出的交易日数（防标签前瞻泄漏）
+        "split_method": "time",
         "split_ratio": list(cfg["split_ratio"]),
+        "purge_days": cfg["purge_days"],
+        "purge_gap_days": split_info.get("gap_days", 0),
+        "purged_samples": split_info.get("purged", 0),
+        "split_ranges": split_ranges,
+        "split_decision_ranges": split_decision,
         "split_paths": split_paths,
         "split_stats": split_stats,
         # 兼容旧字段
@@ -333,11 +353,14 @@ def main(argv: list[str] | None = None) -> int:
         f"（none=推理仅用 argmax，loss=推理再乘一次上述权重）",
         f"early_stopping: {cfg.get('early_stopping')}   save_best: {cfg.get('save_best')}",
         f"随机种子: {cfg['seed']}",
-        f"分层划分比例(train/valid/test): "
-        f"{'/'.join(f'{r:g}' for r in cfg['split_ratio'])}",
+        f"划分方式: 按窗口时间顺序（train < valid < test，测试集时间最新）",
+        f"划分比例(train/valid/test): "
+        f"{'/'.join(f'{r:g}' for r in cfg['split_ratio'])}"
+        f"   purge_days: {cfg['purge_days']}（日历间隔 {split_info.get('gap_days', 0)} 天）",
         "",
-        "== 数据划分（按末日标签分层，保证三集合类别占比一致） ==",
-        split_table(y, split_indices, classes),
+        "== 数据划分（按时间顺序切分，边界 purge 防未来数据泄漏） ==",
+        split_table(y, split_indices, classes, spans=spans,
+                    split_info={**split_info, "purge_days": cfg["purge_days"]}),
         "",
         "== 训练曲线 ==",
     ]

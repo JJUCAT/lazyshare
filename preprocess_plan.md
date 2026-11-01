@@ -1,10 +1,11 @@
 preprocess 实现：
 1.src/preprocess/handle 负责基础工作
-2.src/preprocess/label 负责标签计算
+2.src/preprocess/label 负责标签计算（峰值标签；三元屏蔽的参数配置见 label 段）
 3.config/preprocess.json 配置文件：
   "raw_data"：原始数据路径
   "preprocessed_data"：预处理数据路径
   "weather"：行业成交量，大盘成交量
+  "label"：三元屏蔽（止盈 / 止损 / 时限）参数，见下文“label 配置参数说明”
 4.scripts/preprocess.py：启动预处理
 
 使用一半 cpu 核心数量多线程加速处理
@@ -31,19 +32,36 @@ st，*st，退市股票跳过，不生成预处理数据文件
   TR：换手率
   IMV：行业成交量 / 大盘成交量。表示行业热度。
   SIV：个股成交量 / 行业成交量。表示个股在行业热度。
-  峰值标签：T，B，N
+  峰值标签：T，B，N（列名沿用"峰值标签"，取值由三元屏蔽法给出）
 }
 
-峰值标签：
-T：Top 表示收盘价在一段时间内是高峰值。
-  用滑动窗口 k=21，在 M21C 数据中找出最高值那天 pt_day。
-  从 pt_day 开始往前找 k 天（包括 pt_day 当天），收盘价最高那天是 ct_day。
-  ct_day 前后 k 天都是最高值的话，ct_day 及其前 4 天都标记为 T，共 5 天。
-B：Bottom 表示收盘价在一段时间内是低谷值。
-  用滑动窗口 k，在 M21C 数据中找出最低值那天 pb_day。
-  从 pb_day 开始往前找 k 天（包括 pb_day 当天），收盘价最低那天是 cb_day。
-  cb_day 前后 k 天都是最低值的话，cb_day 及其后 4 天都标记为 B，共 5 天。
-N：除了 T 和 B 之外的都是 None。
+峰值标签：使用三元屏蔽法（triple barrier），止盈标注 T，止损标注 B，其他标注无操作 N
+preprocess.json 参数说明
+"label": {
+  "max_days": 21, // 观察天数
+  "price": "开盘价", // 收益计算使用的价格，profit_{k}=(O_{k+1}-O_{k})/O_{k}
+  "take_profit": 0.15, // 收益止盈百分比
+  "stop_loss": 0.1, // 收益止损百分比
+  "same_day_priority": "stop_loss", // 同时触发优先标注止损
+  "values": {
+    "take_profit": "B", // 止盈标注
+    "stop_loss": "T", // 止损标注
+    "timeout": "N" // 无操作
+  }
+}
+
+三元屏蔽标注实现（src/preprocess/label/triple_barrier.py）
+对第 t 个交易日：
+  1.入场价 = price[t]（默认开盘价）
+  2.依次取 k = 1..max_days，计算 profit_k = (price[t+k] - price[t]) / price[t]
+       profit_k >= take_profit → 止盈，标注 values.take_profit（B，买入）
+       profit_k <= -stop_loss  → 止损，标注 values.stop_loss（T，卖出）
+  3.先触发的一侧即为该日标签；max_days 内均未触发 → 标注 values.timeout（N）
+  4.同一个 k 同时越过两侧屏障（跳空等极端情形）→ 按 same_day_priority 决定
+  5.价格缺失或未来 max_days 个交易日数据不完整的行（含文件末尾 max_days 行）
+    标签为空，预处理阶段直接丢弃，避免用不完整的前瞻窗口训练
+标签参数写入 preprocessed_data/.label_signature.json；参数变化时自动清理旧
+预处理文件后重新生成（--update 也生效）
 
 实现 update 接口：
 从 "raw_data" 更新新数据到 "preprocessed_data" 路径

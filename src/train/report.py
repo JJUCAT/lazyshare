@@ -25,12 +25,16 @@ def _pct(a: int, b: int) -> str:
     return f"{(a / b * 100):.2f}%" if b else "-"
 
 
-def split_table(y, splits: dict[str, np.ndarray], classes: list[str]) -> str:
-    """输出训练 / 验证 / 测试三集合的样本数与标签分布对比表。
+def split_table(y, splits: dict[str, np.ndarray], classes: list[str],
+                spans=None, split_info: dict | None = None) -> str:
+    """输出训练 / 验证 / 测试三集合的样本数、时间范围与标签分布对比表。
 
-    y      : 全样本标签数组
-    splits : {"train": idx, "valid": idx, "test": idx}
-    classes: 类别顺序
+    y          : 全样本标签数组
+    splits     : {"train": idx, "valid": idx, "test": idx}
+    classes    : 类别顺序
+    spans      : 可选，(n, 2) datetime64 数组（窗口首日 / 末日）；给出时表格
+                 增加"时间范围"列，并把校验改为时间顺序校验（防未来数据泄漏）
+    split_info : 可选，time_split() 返回的 info（purged / gap_days / *_span）
     """
     y = np.asarray(y)
     total = len(y)
@@ -40,7 +44,12 @@ def split_table(y, splits: dict[str, np.ndarray], classes: list[str]) -> str:
                  for c in classes),
              ""]
 
-    header = f"{'集合':<8}{'样本数':>8}{'占比':>9}"
+    span_arr = np.asarray(spans, dtype="datetime64[D]") if spans is not None else None
+
+    header = f"{'集合':<8}"
+    if span_arr is not None:
+        header += f"{'决策日范围(窗口末日)':<28}"
+    header += f"{'样本数':>8}{'占比':>9}"
     for c in classes:
         header += f"{c + '数':>8}{c + '占比':>10}"
     lines.append(header)
@@ -49,14 +58,42 @@ def split_table(y, splits: dict[str, np.ndarray], classes: list[str]) -> str:
         idx = np.asarray(splits.get(name, []), dtype=int)
         sub = y[idx] if len(idx) else np.asarray([], dtype=y.dtype)
         n = len(sub)
-        row = f"{name:<8}{n:>8}{_pct(n, total):>9}"
+        row = f"{name:<8}"
+        if span_arr is not None:
+            if len(idx):
+                # 只用窗口末日（标签锚点）：长停牌股票的特征区间会互相重叠，
+                # 决策日区间才是严格有序的
+                rng = f"{span_arr[idx, 1].min()} ~ {span_arr[idx, 1].max()}"
+            else:
+                rng = "-"
+            row += f"{rng:<28}"
+        row += f"{n:>8}{_pct(n, total):>9}"
         for c in classes:
             k = int((sub == c).sum())
             row += f"{k:>8}{_pct(k, n):>10}"
         lines.append(row)
 
-    # 比例一致性检查：各集合每类占比与全集占比的最大偏差（百分点）
     lines.append("")
+    if span_arr is not None:
+        # 时间顺序校验：严格 train < valid < test（测试集最新）
+        def _rng(name: str) -> tuple[str, str]:
+            idx = np.asarray(splits.get(name, []), dtype=int)
+            if not len(idx):
+                return "-", "-"
+            return str(span_arr[idx, 0].min()), str(span_arr[idx, 1].max())
+
+        tr, va, te = _rng("train"), _rng("valid"), _rng("test")
+        lines.append(
+            f"时间顺序校验: train 决策日 {tr[1]} < valid 决策日 {va[1]}"
+            f" < test 决策日 {te[1]}（按窗口末日=标签锚点，测试集时间最新）")
+        if split_info:
+            lines.append(
+                f"purge 间隔: {split_info.get('gap_days', 0)} 个日历日"
+                f"（≈ {split_info.get('purge_days', '?')} 个交易日的前瞻窗口）："
+                f"只丢弃标签前瞻会跨集合的样本，共 {split_info.get('purged', 0)} 个")
+        return "\n".join(lines)
+
+    # 旧口径（随机划分）的比例一致性检查
     overall = {c: float((y == c).sum()) / total for c in classes}
     worst = 0.0
     worst_desc = ""

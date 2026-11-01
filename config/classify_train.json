@@ -16,11 +16,7 @@
     "label": [
       "峰值标签"
     ],
-    "throw_last_one": true,
-    "income_filter":{
-      "time": 42,
-      "increase": 0.2
-    }
+    "throw_last_one": true
   },
 
   "data_source": "/Users/jucat/data/ashare/preprocessed",
@@ -43,9 +39,10 @@
       "valid": 0.2,
       "test": 0.2
     },
+    "purge_days": 21,
     "loss_label_weight": {
-      "T": 1.0,
-      "B": 10.0,
+      "T": 1.5,
+      "B": 1.5,
       "N": 1.0
     },
     "decision_weight": "none",

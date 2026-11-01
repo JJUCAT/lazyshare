@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""business 层单元测试：DataStore / ChartModel / 预处理峰值标签。"""
+"""business 层单元测试：DataStore / ChartModel / 预处理三元屏蔽标签。"""
 from __future__ import annotations
 
 import json
@@ -18,8 +18,11 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.gui.business.chart_model import DEFAULT_SHOW_DAYS, ChartModel
 from src.gui.business.data_store import DataStore
 from src.gui.business.window_config import WindowConfig, extract_display_config
-from src.preprocess.handle.indicators import is_st_stock
-from src.preprocess.label.peak import compute_peak_labels
+from src.preprocess.handle.indicators import is_skipped_stock
+from src.preprocess.label.triple_barrier import (
+    compute_triple_barrier_labels,
+    normalize_label_config,
+)
 
 COLUMNS = ["日期", "股票代码", "股票名称", "行业", "收盘价",
            "M21C", "M5C", "M21V", "M5V", "NC", "NV", "SNC", "SNV",
@@ -223,25 +226,46 @@ class WindowConfigTest(unittest.TestCase):
 
 
 class PreprocessHelperTest(unittest.TestCase):
-    def test_peak_labels(self) -> None:
-        n = 100
-        base = 10.0 + np.arange(n) * 0.1
-        spike = np.zeros(n)
-        spike[::25] = 5.0
-        close = base + spike
-        m21c = pd.Series(close).rolling(21, min_periods=21).mean().to_numpy()
-        labels = compute_peak_labels(close, m21c, k=21)
-        self.assertEqual(len(labels), n)
-        self.assertIn("T", labels)
-        self.assertIn("B", labels)
+    def test_triple_barrier_labels(self) -> None:
+        # 价格先涨后跌：涨到 +10% 触发止盈 T，跌到 -10% 触发止损 B
+        price = [10.0, 10.2, 10.5, 11.2, 11.0, 10.0, 9.5, 9.0, 9.2, 9.4]
+        cfg = {
+            "max_days": 3,
+            "price": "开盘价",
+            "take_profit": 0.10,
+            "stop_loss": 0.10,
+            "same_day_priority": "stop_loss",
+            "values": {"take_profit": "T", "stop_loss": "B", "timeout": "N"},
+        }
+        labels = compute_triple_barrier_labels(price, cfg)
+        self.assertEqual(len(labels), len(price))
+        # 末尾 max_days 行前瞻窗口不完整，标签为空（预处理阶段会被丢弃）
+        self.assertEqual(list(labels[-3:]), ["", "", ""])
+        # 第 0 天：3 天内 11.2/10-1=+12% → 止盈 T
+        self.assertEqual(labels[0], "T")
+        # 第 1 天：3 天内未越过止盈/止损屏障 → 超时无操作 N
+        self.assertEqual(labels[1], "N")
+        # 第 3 天：11.2 → 10.0（-10.7%）→ 止损 B
+        self.assertEqual(labels[3], "B")
 
-    def test_is_st_stock(self) -> None:
+    def test_label_config_defaults(self) -> None:
+        cfg = normalize_label_config(None)
+        self.assertEqual(cfg["max_days"], 21)
+        self.assertEqual(cfg["price"], "开盘价")
+        self.assertEqual(cfg["values"],
+                         {"take_profit": "B", "stop_loss": "T", "timeout": "N"})
+        with self.assertRaises(ValueError):
+            normalize_label_config({"max_days": 0})
+        with self.assertRaises(ValueError):
+            normalize_label_config({"take_profit": -0.1})
+
+    def test_is_skipped_stock(self) -> None:
         df = pd.DataFrame({"名称": ["平安银行"], "是否ST": ["否"]})
-        self.assertFalse(is_st_stock(df))
+        self.assertFalse(is_skipped_stock(df))
         df2 = pd.DataFrame({"名称": ["ST星源"], "是否ST": ["否"]})
-        self.assertTrue(is_st_stock(df2))
+        self.assertTrue(is_skipped_stock(df2))
         df3 = pd.DataFrame({"名称": ["某公司"], "是否ST": ["是"]})
-        self.assertTrue(is_st_stock(df3))
+        self.assertTrue(is_skipped_stock(df3))
 
 
 if __name__ == "__main__":
