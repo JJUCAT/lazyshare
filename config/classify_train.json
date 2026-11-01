@@ -32,10 +32,11 @@
   "train": {
     "arch": "InceptionTimePlus",
     "tfms": "TSClassification",
-    "batch_tfms": "TSStandardize",
+    "batch_tfms": "",
     "batch_size": 128,
     "epochs": 30,
     "learning_rate": 0.001,
+    "seed": 42,
     "validation_set": 0.1,
     "split": {
       "train": 0.6,
