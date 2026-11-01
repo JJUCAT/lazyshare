@@ -30,8 +30,10 @@
     "tfms": "TSClassification",
     "batch_tfms": "",
     "batch_size": 128,
-    "epochs": 30,
-    "learning_rate": 0.001,
+    "epochs": 20,
+    "learning_rate": 0.0003,
+    "scheduler": "flat_cos",
+    "pct_start": 0.3,
     "seed": 42,
     "validation_set": 0.1,
     "split": {
@@ -41,8 +43,8 @@
     },
     "purge_days": 21,
     "loss_label_weight": {
-      "T": 1.5,
-      "B": 1.5,
+      "T": 2.0,
+      "B": 3.0,
       "N": 1.0
     },
     "decision_weight": "none",

@@ -102,6 +102,25 @@ def build_ts_classifier(X, y, train_idx, valid_idx, cfg: dict):
     return clf
 
 
+def fit_scheduler(clf, cfg: dict, callbacks=None) -> None:
+    """按 train.scheduler 选择学习率调度方式拟合。
+
+    - flat_cos  : 从 lr 单调余弦衰减（默认；无 warmup，避免最佳点落在 warmup 段）
+    - one_cycle : 含 warmup 的 one-cycle，warmup 占比 = train.pct_start
+    - cosine    : fastai fit() 的余弦退火
+    """
+    scheduler = cfg.get("scheduler", "flat_cos")
+    epochs = int(cfg["epochs"])
+    lr = float(cfg["learning_rate"])
+    if scheduler == "one_cycle":
+        clf.fit_one_cycle(epochs, lr, pct_start=float(cfg.get("pct_start", 0.3)),
+                          cbs=callbacks or None)
+    elif scheduler == "cosine":
+        clf.fit(epochs, lr, cbs=callbacks or None)
+    else:
+        clf.fit_flat_cos(epochs, lr, cbs=callbacks or None)
+
+
 def build_train_callbacks(cfg: dict, model_name: str, models_dir: Path):
     """构造"早停 + 最优权重回滚"回调。
 
@@ -258,12 +277,13 @@ def main(argv: list[str] | None = None) -> int:
     model_path = cfg["models"] / f"{model_name}.pkl"
 
     callbacks, es_info = build_train_callbacks(cfg, model_name, cfg["models"])
-    logging.info("开始训练: arch=%s, batch_size=%d, epochs=%d, lr=%s",
-                 cfg["arch"], cfg["batch_size"], cfg["epochs"], cfg["learning_rate"])
+    logging.info("开始训练: arch=%s, batch_size=%d, epochs=%d, lr=%s, scheduler=%s",
+                 cfg["arch"], cfg["batch_size"], cfg["epochs"],
+                 cfg["learning_rate"], cfg["scheduler"])
     logging.info("早停/最优权重回滚: monitor=%s, patience=%d, min_delta=%s, save_best=%s",
                  es_info["monitor"], es_info["patience"], es_info["min_delta"],
                  cfg.get("save_best", True))
-    clf.fit_one_cycle(cfg["epochs"], cfg["learning_rate"], cbs=callbacks or None)
+    fit_scheduler(clf, cfg, callbacks)
 
     trained_epochs = len(clf.recorder.values)
     stopped_early = trained_epochs < cfg["epochs"]
@@ -301,6 +321,10 @@ def main(argv: list[str] | None = None) -> int:
         # 训练时使用的 batch_tfms：推理（verify.py / predict.py）据此复现同一
         # 标准化（见 src/train/norm.py），保证训练与推理输入分布一致
         "batch_tfms": cfg.get("batch_tfms"),
+        # 学习率与调度方式（便于追溯该 pkl 的训练口径）
+        "learning_rate": cfg["learning_rate"],
+        "scheduler": cfg["scheduler"],
+        "epochs": cfg["epochs"],
         # 训练损失权重（仅作用于训练阶段）
         "loss_label_weight": cfg.get("loss_label_weight"),
         # 推理决策是否再按上面权重对概率加权（"none" 表示纯 argmax）
@@ -346,7 +370,10 @@ def main(argv: list[str] | None = None) -> int:
         f"seq_len: {cfg['seq_len']}",
         f"架构: {cfg['arch']}",
         f"batch_size: {cfg['batch_size']}   epochs: {cfg['epochs']}"
-        f"   learning_rate: {cfg['learning_rate']}",
+        f"   learning_rate: {cfg['learning_rate']}"
+        f"   scheduler: {cfg['scheduler']}"
+        + (f"(pct_start={cfg['pct_start']:g})"
+           if cfg["scheduler"] == "one_cycle" else ""),
         f"batch_tfms: {cfg.get('batch_tfms')}",
         f"loss_label_weight: {cfg.get('loss_label_weight')}",
         f"decision_weight: {cfg.get('decision_weight')}"

@@ -40,8 +40,16 @@ preprocess.json 参数说明
 "label": {
   "max_days": 21, // 观察天数
   "price": "开盘价", // 收益计算使用的价格，profit_{k}=(O_{k+1}-O_{k})/O_{k}
-  "take_profit": 0.15, // 收益止盈百分比
-  "stop_loss": 0.1, // 收益止损百分比
+  "barrier_mode": "atr", // 屏障方式："fixed" 固定百分比 / "atr" 按波动率自适应
+  "take_profit": 0.15, // 固定止盈百分比（barrier_mode="fixed" 时使用）
+  "stop_loss": 0.1, // 固定止损百分比（barrier_mode="fixed" 时使用）
+  "atr_window": 21, // ATR 滚动均值窗口（barrier_mode="atr" 时使用）
+  "take_profit_atr": 3, // 止盈屏障 = take_profit_atr × ATR
+  "stop_loss_atr": 2, // 止损屏障 = stop_loss_atr × ATR
+  "min_take_profit": 0.06, // 止盈屏障下限（防止低波动股屏障过窄）
+  "max_take_profit": 0.3, // 止盈屏障上限
+  "min_stop_loss": 0.04, // 止损屏障下限
+  "max_stop_loss": 0.2, // 止损屏障上限
   "same_day_priority": "stop_loss", // 同时触发优先标注止损
   "values": {
     "take_profit": "B", // 止盈标注
@@ -49,6 +57,12 @@ preprocess.json 参数说明
     "timeout": "N" // 无操作
   }
 }
+
+波动率自适应屏障（barrier_mode="atr"）
+  ATR_pct[t] = 截至第 t 日的 atr_window 日滚动平均单日真实波动率（只用 t 及之前的数据）
+  take_profit_t = clip(take_profit_atr × ATR_pct[t], min_take_profit, max_take_profit)
+  stop_loss_t   = clip(stop_loss_atr   × ATR_pct[t], min_stop_loss,   max_stop_loss)
+  高波动股票屏障自动放宽、低波动股票收窄，避免固定百分比对不同波动股票的偏倚
 
 三元屏蔽标注实现（src/preprocess/label/triple_barrier.py）
 对第 t 个交易日：

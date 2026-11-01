@@ -252,12 +252,49 @@ class PreprocessHelperTest(unittest.TestCase):
         cfg = normalize_label_config(None)
         self.assertEqual(cfg["max_days"], 21)
         self.assertEqual(cfg["price"], "开盘价")
+        self.assertEqual(cfg["barrier_mode"], "fixed")
+        self.assertEqual(cfg["atr_window"], 21)
+        self.assertEqual(cfg["take_profit_atr"], 3.0)
+        self.assertEqual(cfg["stop_loss_atr"], 2.0)
         self.assertEqual(cfg["values"],
                          {"take_profit": "B", "stop_loss": "T", "timeout": "N"})
         with self.assertRaises(ValueError):
             normalize_label_config({"max_days": 0})
         with self.assertRaises(ValueError):
             normalize_label_config({"take_profit": -0.1})
+        with self.assertRaises(ValueError):
+            normalize_label_config({"barrier_mode": "unknown"})
+        with self.assertRaises(ValueError):
+            normalize_label_config({"min_take_profit": 0.3, "max_take_profit": 0.2})
+
+    def test_atr_barriers_scale_with_volatility(self) -> None:
+        """屏障 = k × ATR：高波动需更大涨幅才止盈，低波动更容易触发。"""
+        price = [10.0, 10.3, 10.7, 10.8, 10.9]
+        cfg = {
+            "max_days": 2,
+            "barrier_mode": "atr",
+            "take_profit_atr": 3.0,
+            "stop_loss_atr": 2.0,
+            "min_take_profit": 0.06,
+            "max_take_profit": 0.30,
+            "min_stop_loss": 0.04,
+            "max_stop_loss": 0.20,
+        }
+        # 波动率 3% → 止盈屏障 9%，2 天内最大涨幅 7% 未触发 → N
+        high_vol = [0.03] * len(price)
+        labels = compute_triple_barrier_labels(price, cfg, high_vol)
+        self.assertEqual(labels[0], "N")
+        # 波动率 1% → 止盈屏障被下限裁剪为 6%，7% 触发 → 止盈 B
+        low_vol = [0.01] * len(price)
+        labels = compute_triple_barrier_labels(price, cfg, low_vol)
+        self.assertEqual(labels[0], "B")
+        # ATR 缺失（NaN）的行无效
+        nan_vol = [float("nan")] * len(price)
+        labels = compute_triple_barrier_labels(price, cfg, nan_vol)
+        self.assertEqual(list(labels), [""] * len(price))
+        # atr 模式未提供波动率时报错
+        with self.assertRaises(ValueError):
+            compute_triple_barrier_labels(price, cfg, None)
 
     def test_is_skipped_stock(self) -> None:
         df = pd.DataFrame({"名称": ["平安银行"], "是否ST": ["否"]})

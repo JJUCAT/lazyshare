@@ -124,6 +124,21 @@ def load_config(config_path: Path = DEFAULT_CONFIG) -> dict:
     if purge_days < 0:
         raise ValueError(f"train.purge_days 必须 >= 0，当前 {purge_days}")
 
+    # 学习率调度（train.scheduler）：
+    #   flat_cos  : 从 lr 单调余弦衰减（默认）。one_cycle 的前 30% 是 warmup，
+    #               小信号数据上最佳点常落在 warmup 段（LR 还没升到峰值），
+    #               导致"欠训练 + 已开始过拟合"，故默认改用 flat_cos。
+    #   one_cycle : 含 warmup 的 one-cycle（pct_start 控制 warmup 占比）
+    #   cosine    : fastai fit() 的余弦退火，起点为 lr
+    scheduler = str(train_cfg.get("scheduler") or "flat_cos").strip().lower()
+    if scheduler not in ("flat_cos", "one_cycle", "cosine"):
+        raise ValueError(
+            f'train.scheduler 只支持 "flat_cos" / "one_cycle" / "cosine"，'
+            f'当前 {scheduler!r}')
+    pct_start = float(train_cfg.get("pct_start", 0.3))
+    if not 0.0 < pct_start < 1.0:
+        raise ValueError(f"train.pct_start 必须在 (0, 1) 之间，当前 {pct_start}")
+
     # 随机种子：显式配置整数则固定可复现；缺省 / null / "auto" / "random"
     # 用当前时间生成随机种子，使每次训练抽样的训练集不同
     seed_cfg = train_cfg.get("seed", "auto")
@@ -159,6 +174,8 @@ def load_config(config_path: Path = DEFAULT_CONFIG) -> dict:
         "batch_size": int(train_cfg.get("batch_size", 32)),
         "epochs": int(train_cfg.get("epochs", 100)),
         "learning_rate": float(train_cfg.get("learning_rate", 0.001)),
+        "scheduler": scheduler,
+        "pct_start": pct_start,
         "validation_set": float(train_cfg.get("validation_set", 0.1)),
         "split_ratio": split_ratio,
         "seed": seed,

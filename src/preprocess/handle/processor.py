@@ -133,11 +133,18 @@ def process_file(task: tuple[Path, Path]) -> dict:
     # IMV：行业成交量 / 大盘成交量；SIV：个股成交量 / 行业成交量（基于 weather.csv）
     imv, siv = compute_imv_siv(df, _WEATHER if _WEATHER is not None else EMPTY_WEATHER)
 
-    # 三元屏蔽标签：止盈（默认 T）/ 止损（默认 B）/ 时限无操作（默认 N）
-    # 逐日向前看 label.max_days 个交易日，按 label.price（默认开盘价）计算收益
+    # 三元屏蔽标签：止盈（默认 B）/ 止损（默认 T）/ 时限无操作（默认 N）
+    # 逐日向前看 label.max_days 个交易日，按 label.price（默认开盘价）计算收益；
+    # barrier_mode="atr" 时屏障 = k × 滚动 ATR（只用当日及之前的数据，无未来信息）
+    volatility = None
+    if label_cfg.get("barrier_mode") == "atr":
+        window = int(label_cfg["atr_window"])
+        volatility = ind["atr"].rolling(
+            window=window, min_periods=window).mean().to_numpy(dtype=float)
     labels = compute_triple_barrier_labels(
         pd.to_numeric(df[price_col], errors="coerce").to_numpy(dtype=float),
         label_cfg,
+        volatility,
     )
 
     out = pd.DataFrame(
@@ -286,6 +293,13 @@ def ensure_label_signature(out_dir: Path, label_cfg: dict) -> int:
     return removed
 
 
+def _barrier_text(label_cfg: dict, key: str) -> str:
+    """日志用：屏障参数的简短描述（固定百分比 / ATR 倍数）。"""
+    if label_cfg["barrier_mode"] == "atr":
+        return f"{label_cfg[key + '_atr']:g}×ATR"
+    return f"{label_cfg[key]:g}"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="A 股日线数据预处理（多进程并行）")
     parser.add_argument(
@@ -342,13 +356,22 @@ def main(argv: list[str] | None = None) -> int:
     logging.info("并行 worker 数量: %d（CPU 核心数: %s）",
                  n_workers, os.cpu_count())
     logging.info(
-        "三元屏蔽标签: max_days=%d, price=%s, take_profit=%s→%s, "
-        "stop_loss=%s→%s, timeout→%s, same_day_priority=%s",
-        label_cfg["max_days"], label_cfg["price"],
-        label_cfg["take_profit"], label_cfg["values"]["take_profit"],
-        label_cfg["stop_loss"], label_cfg["values"]["stop_loss"],
+        "三元屏蔽标签: max_days=%d, price=%s, barrier_mode=%s, "
+        "take_profit=%s→%s, stop_loss=%s→%s, timeout→%s, same_day_priority=%s",
+        label_cfg["max_days"], label_cfg["price"], label_cfg["barrier_mode"],
+        _barrier_text(label_cfg, "take_profit"), label_cfg["values"]["take_profit"],
+        _barrier_text(label_cfg, "stop_loss"), label_cfg["values"]["stop_loss"],
         label_cfg["values"]["timeout"], label_cfg["same_day_priority"],
     )
+    if label_cfg["barrier_mode"] == "atr":
+        logging.info(
+            "ATR 自适应屏障: ATR%d 滚动均值, 止盈 %.2f×ATR ∈ [%.2f, %.2f], "
+            "止损 %.2f×ATR ∈ [%.2f, %.2f]",
+            label_cfg["atr_window"], label_cfg["take_profit_atr"],
+            label_cfg["min_take_profit"], label_cfg["max_take_profit"],
+            label_cfg["stop_loss_atr"], label_cfg["min_stop_loss"],
+            label_cfg["max_stop_loss"],
+        )
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # 清理历史遗留的临时文件
