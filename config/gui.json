@@ -29,23 +29,19 @@
       {
         "series": [
           {
-            "column": "ATR",
+            "column": "LU",
             "side": "left"
           },
           {
-            "column": "TR",
-            "side": "right"
-          }
-        ]
-      },
-      {
-        "series": [
-          {
-            "column": "IMV",
+            "column": "OLU",
             "side": "left"
           },
           {
-            "column": "SIV",
+            "column": "HLU",
+            "side": "left"
+          },
+          {
+            "column": "LLU",
             "side": "left"
           }
         ]

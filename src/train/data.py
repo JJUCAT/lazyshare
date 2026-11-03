@@ -117,9 +117,10 @@ def load_config(config_path: Path = DEFAULT_CONFIG) -> dict:
     save_best = bool(train_cfg.get("save_best", True))
 
     # purge 间隔：按时间切分训练/验证/测试时，边界两侧要空出的交易日数。
-    # 三元屏蔽标签会向前看 label.max_days 个交易日，若不留间隔，紧邻边界的
-    # 训练样本标签会用到验证集（乃至测试集）区间的价格，造成未来数据泄漏。
-    # 默认 21（与 config/preprocess.json 的 label.max_days 一致）。
+    # 三元屏蔽标签会向前看 max(止盈时限, 止损时限) 个交易日（config/preprocess.json
+    # 的 label.take_profit_timeout / stop_loss_timeout），若不留间隔，紧邻边界
+    # 的训练样本标签会用到验证集（乃至测试集）区间的价格，造成未来数据泄漏。
+    # 默认 21（大于当前标签前瞻 10 个交易日，留有余量）。
     purge_days = int(train_cfg.get("purge_days", 21))
     if purge_days < 0:
         raise ValueError(f"train.purge_days 必须 >= 0，当前 {purge_days}")

@@ -15,7 +15,8 @@ DEFAULT_CONFIG = PROJECT_ROOT / "config" / "preprocess.json"
 def load_config(config_path: Path = DEFAULT_CONFIG) -> dict:
     """返回 {"raw_dir", "out_dir", "weather", "label"}，路径不存在时抛异常。
 
-    label 为三元屏蔽（止盈 / 止损 / 时限）配置，见 preprocess_plan.md。
+    label 为简单三元屏蔽（止盈 / 止损 / 时限 / 取值）配置，盈亏按 LU 累加计算，
+    见 preprocess_plan.md。
     """
     config_path = Path(config_path)
     if not config_path.exists():

@@ -15,7 +15,10 @@ from pathlib import Path
 
 import pandas as pd
 
-from ..label.triple_barrier import compute_triple_barrier_labels
+from ..label.triple_barrier import (
+    compute_triple_barrier_labels,
+    label_lookahead,
+)
 from .config import DEFAULT_CONFIG, PROJECT_ROOT, load_config
 from .indicators import (
     COL_CLOSE,
@@ -25,6 +28,7 @@ from .indicators import (
     COL_INDUSTRY,
     COL_LOW,
     COL_NAME,
+    COL_OPEN,
     COL_VOLUME,
     FLOAT_COLUMNS,
     FLOAT_DECIMALS,
@@ -46,7 +50,7 @@ _STOCK_FILE_RE = re.compile(r"^\d{6}[-_]")
 # weather.csv 查询表（由进程池 worker 经 initializer 加载一次，供 IMV/SIV 计算）
 _WEATHER: dict | None = None
 
-# 三元屏蔽标签配置（由进程池 worker 经 initializer 加载一次）
+# 三元屏蔽（止盈 / 止损 / 时限）标签配置（由进程池 worker 经 initializer 加载一次）
 _LABEL_CFG: dict | None = None
 
 
@@ -96,13 +100,12 @@ def process_file(task: tuple[Path, Path]) -> dict:
         return {"status": "empty", "code": None, "name": None,
                 "message": "空文件"}
 
-    # 三元屏蔽（止盈 / 止损 / 时限）标签配置；worker 未初始化时退回默认值
+    # 简单三元屏蔽（止盈 / 止损 / 时限）标签配置；worker 未初始化时退回默认值
     label_cfg = _LABEL_CFG or {}
-    price_col = str(label_cfg.get("price") or "开盘价")
 
     # 必要列校验（防止 weather.csv 等非股票文件导致任务整体崩溃）
     _REQUIRED_COLS = (COL_DATE, COL_CODE, COL_NAME, COL_INDUSTRY,
-                      COL_CLOSE, COL_HIGH, COL_LOW, COL_VOLUME, price_col)
+                      COL_OPEN, COL_CLOSE, COL_HIGH, COL_LOW, COL_VOLUME)
     missing = [c for c in _REQUIRED_COLS if c not in df.columns]
     if missing:
         return {"status": "error", "code": None, "name": None,
@@ -133,18 +136,13 @@ def process_file(task: tuple[Path, Path]) -> dict:
     # IMV：行业成交量 / 大盘成交量；SIV：个股成交量 / 行业成交量（基于 weather.csv）
     imv, siv = compute_imv_siv(df, _WEATHER if _WEATHER is not None else EMPTY_WEATHER)
 
-    # 三元屏蔽标签：止盈（默认 B）/ 止损（默认 T）/ 时限无操作（默认 N）
-    # 逐日向前看 label.max_days 个交易日，按 label.price（默认开盘价）计算收益；
-    # barrier_mode="atr" 时屏障 = k × 滚动 ATR（只用当日及之前的数据，无未来信息）
-    volatility = None
-    if label_cfg.get("barrier_mode") == "atr":
-        window = int(label_cfg["atr_window"])
-        volatility = ind["atr"].rolling(
-            window=window, min_periods=window).mean().to_numpy(dtype=float)
+    # 简单三元屏蔽标签：止盈（默认 B）/ 止损（默认 T）/ 其他（默认 N）
+    # 盈亏用 LU（涨跌幅利用率）累加衡量：profit_k = Σ LU[t+1..t+k]；
+    # 止盈只在 k = 1..take_profit_timeout 内检查，止损只在 k = 1..stop_loss_timeout
+    # 内检查（各自独立窗口）
     labels = compute_triple_barrier_labels(
-        pd.to_numeric(df[price_col], errors="coerce").to_numpy(dtype=float),
+        ind["lu"].to_numpy(dtype=float),
         label_cfg,
-        volatility,
     )
 
     out = pd.DataFrame(
@@ -156,20 +154,21 @@ def process_file(task: tuple[Path, Path]) -> dict:
             "收盘价": ind["close"],
             "成交量": ind["volume"],
             "LU": ind["lu"],
+            "OLU": ind["olu"],
+            "HLU": ind["hlu"],
+            "LLU": ind["llu"],
             "M21C": ind["m21c"],
             "M21V": ind["m21v"],
             "NC": ind["nc"],
             "NV": ind["nv"],
             "ATR": ind["atr"],
-            "NBull": ind["nbull"],
-            "NBear": ind["nbear"],
             "TR": ind["tr"],
             "IMV": imv,
             "SIV": siv,
             "峰值标签": labels,
         }
     )
-    # 丢弃末尾 label.max_days 行：其前瞻窗口不完整，标签为空（无法判定三元屏障）
+    # 丢弃末尾 lookahead 行：其前瞻窗口不完整，标签为空（无法判定三元屏障）
     out = out[out["峰值标签"].astype(str).str.strip() != ""].reset_index(drop=True)
     # 跳过上市前 IPO_SKIP_DAYS 个交易日（该区间涨跌幅无限制，LU 无意义）
     out = out.iloc[IPO_SKIP_DAYS:].reset_index(drop=True)
@@ -183,7 +182,7 @@ def process_file(task: tuple[Path, Path]) -> dict:
     return {"status": "ok", "code": code, "name": name, "message": None}
 
 
-def needs_update(raw_file: Path, out_dir: Path, max_days: int = 0) -> bool:
+def needs_update(raw_file: Path, out_dir: Path, lookahead: int = 0) -> bool:
     """判断原始文件是否需要重新生成预处理输出（增量更新）。
 
     - ST 股票不生成输出，无需更新
@@ -191,8 +190,10 @@ def needs_update(raw_file: Path, out_dir: Path, max_days: int = 0) -> bool:
     - 输出文件缺少原始数据中的任意日期 → 需要
     - 输出文件已包含原始数据全部日期 → 无需
 
-    max_days：三元屏蔽标签的观察天数。原始数据末尾 max_days 个交易日的前瞻
-    窗口不完整，预处理会丢弃这些行，因此比对时不计入（否则永远判定"需要更新"）。
+    lookahead：三元屏蔽标签向前看的交易日数
+    （max(take_profit_timeout, stop_loss_timeout)）。原始数据末尾 lookahead
+    个交易日的前瞻窗口不完整，预处理会丢弃这些行，因此比对时不计入
+    （否则永远判定"需要更新"）。
     """
     raw_dates: list[str] = []
     code = name = ""
@@ -255,8 +256,8 @@ def needs_update(raw_file: Path, out_dir: Path, max_days: int = 0) -> bool:
                     out_dates.add(row[di])
     except OSError:
         return True
-    # 末尾 max_days 天的前瞻窗口不完整，预处理本就会丢弃，不参与比对
-    expected = raw_dates[: len(raw_dates) - max_days] if max_days > 0 else raw_dates
+    # 末尾 lookahead 天的前瞻窗口不完整，预处理本就会丢弃，不参与比对
+    expected = raw_dates[: len(raw_dates) - lookahead] if lookahead > 0 else raw_dates
     return not set(expected).issubset(out_dates)
 
 
@@ -267,10 +268,10 @@ LABEL_SIG_FILE = ".label_signature.json"
 def ensure_label_signature(out_dir: Path, label_cfg: dict) -> int:
     """校验 out_dir 内的 label 配置指纹，不匹配时清理旧预处理文件。
 
-    三元屏蔽标签依赖 label 段（观察天数 / 止盈 / 止损 / 取值），参数一变，
-    旧输出里的"峰值标签"列全部失效。此处在处理前比对指纹：不一致则删除
-    out_dir 下所有 *.csv（保留子目录如 tasks），由本次运行重新生成。
-    返回清理的文件数量。
+    三元屏蔽标签依赖 label 段（止盈 / 止盈时限 / 止损 / 止损时限 / 取值），
+    参数一变，旧输出里的"峰值标签"列全部失效。此处在处理前比对指纹：
+    不一致则删除 out_dir 下所有 *.csv（保留子目录如 tasks），由本次运行
+    重新生成。返回清理的文件数量。
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     sig_path = out_dir / LABEL_SIG_FILE
@@ -291,13 +292,6 @@ def ensure_label_signature(out_dir: Path, label_cfg: dict) -> int:
     if removed:
         logging.warning("label 配置变化：清理旧预处理文件 %d 个，重新生成", removed)
     return removed
-
-
-def _barrier_text(label_cfg: dict, key: str) -> str:
-    """日志用：屏障参数的简短描述（固定百分比 / ATR 倍数）。"""
-    if label_cfg["barrier_mode"] == "atr":
-        return f"{label_cfg[key + '_atr']:g}×ATR"
-    return f"{label_cfg[key]:g}"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -339,8 +333,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.update:
         before = len(raw_files)
+        lookahead = label_lookahead(label_cfg)
         raw_files = [f for f in raw_files
-                     if needs_update(f, out_dir, label_cfg["max_days"])]
+                     if needs_update(f, out_dir, lookahead)]
         logging.info("update 模式：共 %d 个原始文件，%d 个需要更新",
                      before, len(raw_files))
 
@@ -356,22 +351,14 @@ def main(argv: list[str] | None = None) -> int:
     logging.info("并行 worker 数量: %d（CPU 核心数: %s）",
                  n_workers, os.cpu_count())
     logging.info(
-        "三元屏蔽标签: max_days=%d, price=%s, barrier_mode=%s, "
-        "take_profit=%s→%s, stop_loss=%s→%s, timeout→%s, same_day_priority=%s",
-        label_cfg["max_days"], label_cfg["price"], label_cfg["barrier_mode"],
-        _barrier_text(label_cfg, "take_profit"), label_cfg["values"]["take_profit"],
-        _barrier_text(label_cfg, "stop_loss"), label_cfg["values"]["stop_loss"],
-        label_cfg["values"]["timeout"], label_cfg["same_day_priority"],
+        "简单三元屏蔽标签（盈亏=Σ LU）: 止盈 LU>=%.2f / 前 %d 日→%s, "
+        "止损 LU<=-%.2f / 前 %d 日→%s, 其他→%s（同一日双触发优先止损）",
+        label_cfg["take_profit"], label_cfg["take_profit_timeout"],
+        label_cfg["values"]["take_profit"],
+        label_cfg["stop_loss"], label_cfg["stop_loss_timeout"],
+        label_cfg["values"]["stop_loss"],
+        label_cfg["values"]["timeout"],
     )
-    if label_cfg["barrier_mode"] == "atr":
-        logging.info(
-            "ATR 自适应屏障: ATR%d 滚动均值, 止盈 %.2f×ATR ∈ [%.2f, %.2f], "
-            "止损 %.2f×ATR ∈ [%.2f, %.2f]",
-            label_cfg["atr_window"], label_cfg["take_profit_atr"],
-            label_cfg["min_take_profit"], label_cfg["max_take_profit"],
-            label_cfg["stop_loss_atr"], label_cfg["min_stop_loss"],
-            label_cfg["max_stop_loss"],
-        )
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # 清理历史遗留的临时文件

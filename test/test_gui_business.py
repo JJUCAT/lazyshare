@@ -18,7 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.gui.business.chart_model import DEFAULT_SHOW_DAYS, ChartModel
 from src.gui.business.data_store import DataStore
 from src.gui.business.window_config import WindowConfig, extract_display_config
-from src.preprocess.handle.indicators import is_skipped_stock
+from src.preprocess.handle.indicators import compute_indicators, is_skipped_stock
 from src.preprocess.label.triple_barrier import (
     compute_triple_barrier_labels,
     normalize_label_config,
@@ -227,74 +227,95 @@ class WindowConfigTest(unittest.TestCase):
 
 class PreprocessHelperTest(unittest.TestCase):
     def test_triple_barrier_labels(self) -> None:
-        # 价格先涨后跌：涨到 +10% 触发止盈 T，跌到 -10% 触发止损 B
-        price = [10.0, 10.2, 10.5, 11.2, 11.0, 10.0, 9.5, 9.0, 9.2, 9.4]
+        # 简单三元屏蔽（盈亏 = 未来 LU 累加）：止盈 LU>=0.3 → B，止损 LU<=-0.2 → T
+        lu = [0.0, 0.1, 0.1, 0.2, 0.05, 0.05, 0.0, -0.1, -0.1, -0.1, -0.1]
         cfg = {
-            "max_days": 3,
-            "price": "开盘价",
-            "take_profit": 0.10,
-            "stop_loss": 0.10,
-            "same_day_priority": "stop_loss",
-            "values": {"take_profit": "T", "stop_loss": "B", "timeout": "N"},
+            "take_profit": 0.3,
+            "take_profit_timeout": 3,
+            "stop_loss": -0.2,
+            "stop_loss_timeout": 3,
         }
-        labels = compute_triple_barrier_labels(price, cfg)
-        self.assertEqual(len(labels), len(price))
-        # 末尾 max_days 行前瞻窗口不完整，标签为空（预处理阶段会被丢弃）
+        labels = compute_triple_barrier_labels(lu, cfg)
+        self.assertEqual(len(labels), len(lu))
+        # 末尾 max(止盈时限, 止损时限) 行前瞻窗口不完整，标签为空（预处理会丢弃）
         self.assertEqual(list(labels[-3:]), ["", "", ""])
-        # 第 0 天：3 天内 11.2/10-1=+12% → 止盈 T
-        self.assertEqual(labels[0], "T")
-        # 第 1 天：3 天内未越过止盈/止损屏障 → 超时无操作 N
-        self.assertEqual(labels[1], "N")
-        # 第 3 天：11.2 → 10.0（-10.7%）→ 止损 B
-        self.assertEqual(labels[3], "B")
+        # 第 0 天：3 日内 LU 累计 0.1+0.1+0.2=0.4 >= 0.3 → 止盈 B
+        self.assertEqual(labels[0], "B")
+        # 第 3 天：3 日内 LU 累计仅 0.10 → 未触发 → N
+        self.assertEqual(labels[3], "N")
+        # 第 7 天：3 日内 LU 累计 -0.1-0.1-0.1=-0.3 <= -0.2 → 止损 T
+        self.assertEqual(labels[7], "T")
 
     def test_label_config_defaults(self) -> None:
         cfg = normalize_label_config(None)
-        self.assertEqual(cfg["max_days"], 21)
-        self.assertEqual(cfg["price"], "开盘价")
-        self.assertEqual(cfg["barrier_mode"], "fixed")
-        self.assertEqual(cfg["atr_window"], 21)
-        self.assertEqual(cfg["take_profit_atr"], 3.0)
-        self.assertEqual(cfg["stop_loss_atr"], 2.0)
+        self.assertEqual(cfg["take_profit"], 0.30)
+        self.assertEqual(cfg["take_profit_timeout"], 21)
+        self.assertEqual(cfg["stop_loss"], 0.20)
+        self.assertEqual(cfg["stop_loss_timeout"], 15)
         self.assertEqual(cfg["values"],
                          {"take_profit": "B", "stop_loss": "T", "timeout": "N"})
+        # LU 累计阈值：不再有 price（价格列）配置
+        self.assertNotIn("price", cfg)
+        # stop_loss 正负号等价（统一取绝对值）
+        self.assertEqual(normalize_label_config({"stop_loss": -0.2})["stop_loss"], 0.2)
+        self.assertEqual(normalize_label_config({"stop_loss": 0.2})["stop_loss"], 0.2)
         with self.assertRaises(ValueError):
-            normalize_label_config({"max_days": 0})
+            normalize_label_config({"take_profit": 0})
         with self.assertRaises(ValueError):
-            normalize_label_config({"take_profit": -0.1})
+            normalize_label_config({"take_profit_timeout": 0})
         with self.assertRaises(ValueError):
-            normalize_label_config({"barrier_mode": "unknown"})
+            normalize_label_config({"stop_loss": 0})
         with self.assertRaises(ValueError):
-            normalize_label_config({"min_take_profit": 0.3, "max_take_profit": 0.2})
+            normalize_label_config({"stop_loss_timeout": 0})
 
-    def test_atr_barriers_scale_with_volatility(self) -> None:
-        """屏障 = k × ATR：高波动需更大涨幅才止盈，低波动更容易触发。"""
-        price = [10.0, 10.3, 10.7, 10.8, 10.9]
+    def test_separate_windows(self) -> None:
+        """止盈 / 止损各自独立窗口：超出各自时限的 LU 累计不计入。"""
         cfg = {
-            "max_days": 2,
-            "barrier_mode": "atr",
-            "take_profit_atr": 3.0,
-            "stop_loss_atr": 2.0,
-            "min_take_profit": 0.06,
-            "max_take_profit": 0.30,
-            "min_stop_loss": 0.04,
-            "max_stop_loss": 0.20,
+            "take_profit": 0.3,
+            "take_profit_timeout": 10,
+            "stop_loss": -0.2,
+            "stop_loss_timeout": 5,
         }
-        # 波动率 3% → 止盈屏障 9%，2 天内最大涨幅 7% 未触发 → N
-        high_vol = [0.03] * len(price)
-        labels = compute_triple_barrier_labels(price, cfg, high_vol)
-        self.assertEqual(labels[0], "N")
-        # 波动率 1% → 止盈屏障被下限裁剪为 6%，7% 触发 → 止盈 B
-        low_vol = [0.01] * len(price)
-        labels = compute_triple_barrier_labels(price, cfg, low_vol)
+        # 涨幅出现在 k=8（> 止损时限 5，但 <= 止盈时限 10）→ 止盈 B
+        lu = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0]
+        labels = compute_triple_barrier_labels(lu, cfg)
         self.assertEqual(labels[0], "B")
-        # ATR 缺失（NaN）的行无效
-        nan_vol = [float("nan")] * len(price)
-        labels = compute_triple_barrier_labels(price, cfg, nan_vol)
-        self.assertEqual(list(labels), [""] * len(price))
-        # atr 模式未提供波动率时报错
-        with self.assertRaises(ValueError):
-            compute_triple_barrier_labels(price, cfg, None)
+        # 第 0 天跌幅出现在 k=6（> 止损时限 5）→ 不算止损，标 N
+        # 第 1 天同一跌幅出现在 k=5（<= 5）→ 止损 T
+        lu = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.2, 0.0, 0.0, 0.0, 0.0, 0.0]
+        labels = compute_triple_barrier_labels(lu, cfg)
+        self.assertEqual(labels[0], "N")
+        self.assertEqual(labels[1], "T")
+        # LU 缺失（前瞻窗口内有 NaN）的行无效
+        lu = [0.0, float("nan"), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        labels = compute_triple_barrier_labels(lu, cfg)
+        self.assertEqual(labels[0], "")
+        # 数据过短时全部为空
+        self.assertEqual(list(compute_triple_barrier_labels(
+            [0.0, 0.0, 0.0], cfg)), ["", "", ""])
+
+    def test_lu_olu_hlu_llu(self) -> None:
+        """LU / OLU / HLU / LLU 均按 max_limit × C_{t-1} 归一。"""
+        df = pd.DataFrame({
+            "日期": ["2025-01-02", "2025-01-03", "2025-01-06"],
+            "收盘价": [10.0, 11.0, 9.9],
+            "开盘价": [10.0, 10.5, 10.2],
+            "最高价": [10.5, 11.2, 10.3],
+            "最低价": [9.8, 10.4, 9.8],
+            "成交量（股）": [100, 110, 120],
+        })
+        ind = compute_indicators(df, "000001")   # 沪深主板，max_limit = 10%
+        # 第 0 日没有昨收，四项均缺失
+        for key in ("lu", "olu", "hlu", "llu"):
+            self.assertTrue(np.isnan(ind[key].iloc[0]))
+        # 第 1 日：分母 = 0.10 × 10.0 = 1.0
+        self.assertAlmostEqual(ind["lu"].iloc[1], (11.0 - 10.0) / 1.0, places=9)
+        self.assertAlmostEqual(ind["olu"].iloc[1], (10.5 - 10.0) / 1.0, places=9)
+        self.assertAlmostEqual(ind["hlu"].iloc[1], (11.0 - 11.2) / 1.0, places=9)
+        self.assertAlmostEqual(ind["llu"].iloc[1], (11.0 - 10.4) / 1.0, places=9)
+        # HLU 恒 <= 0（看空回落），LLU 恒 >= 0（看多反弹）
+        self.assertTrue((ind["hlu"].dropna() <= 0).all())
+        self.assertTrue((ind["llu"].dropna() >= 0).all())
 
     def test_is_skipped_stock(self) -> None:
         df = pd.DataFrame({"名称": ["平安银行"], "是否ST": ["否"]})

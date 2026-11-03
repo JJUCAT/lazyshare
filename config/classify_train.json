@@ -4,11 +4,11 @@
     "jump_step": 42,
     "items": [
       "LU",
+      "OLU",
+      "HLU",
+      "LLU",
       "NC",
       "NV",
-      "ATR",
-      "NBull",
-      "NBear",
       "TR",
       "IMV",
       "SIV"

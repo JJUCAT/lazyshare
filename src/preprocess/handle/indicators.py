@@ -3,13 +3,14 @@
 
 指标定义见 preprocess_plan.md：
     LU   = (C_t - C_{t-1}) / (max_limit * C_{t-1})   涨跌幅利用率
+    OLU  = (O_t - C_{t-1}) / (max_limit * C_{t-1})   隔夜消息利用率（高开为正）
+    HLU  = (C_t - H_t)     / (max_limit * C_{t-1})   看空利用率（收盘相对最高价回落，<=0）
+    LLU  = (C_t - L_t)     / (max_limit * C_{t-1})   看多利用率（收盘相对最低价反弹，>=0）
     M21C = 21 日收盘价均值
     M21V = 21 日成交量均值
     NC   = (C - M21C) / M21C                          价格（归一化）
     NV   = (V - M21V) / M21V                          成交量（归一化）
     ATR  = max(H-L, |H-C_{t-1}|, |L-C_{t-1}|) / C_{t-1} 单日真实波动率（归一化）
-    NBull= (H - C) / C                                看多
-    NBear= (C - L) / C                                看空
     TR   = 换手率
     IMV  = 行业成交量 / 大盘成交量                     行业热度
     SIV  = 个股成交量 / 行业成交量                     个股在行业中的热度
@@ -71,13 +72,14 @@ OUTPUT_COLUMNS = [
     "收盘价",
     "成交量",
     "LU",
+    "OLU",
+    "HLU",
+    "LLU",
     "M21C",
     "M21V",
     "NC",
     "NV",
     "ATR",
-    "NBull",
-    "NBear",
     "TR",
     "IMV",
     "SIV",
@@ -89,13 +91,14 @@ FLOAT_COLUMNS = [
     "收盘价",
     "成交量",
     "LU",
+    "OLU",
+    "HLU",
+    "LLU",
     "M21C",
     "M21V",
     "NC",
     "NV",
     "ATR",
-    "NBull",
-    "NBear",
     "TR",
     "IMV",
     "SIV",
@@ -178,12 +181,13 @@ def is_skipped_stock(df) -> bool:
 
 
 def compute_indicators(df, code: str = "") -> dict:
-    """计算各项指标序列（LU / 均值 / 归一化 / 波动 / 看多看空 / 换手率）。
+    """计算各项指标序列（LU/OLU/HLU/LLU / 均值 / 归一化 / 波动 / 换手率）。
 
-    返回 dict，键为：close / high / low / volume / lu / m21c / m21v /
-    nc / nv / atr / nbull / nbear / tr。
+    返回 dict，键为：close / high / low / volume / lu / olu / hlu / llu /
+    m21c / m21v / nc / nv / atr / tr。
     """
     close = pd.to_numeric(df[COL_CLOSE], errors="coerce")
+    open_ = pd.to_numeric(df[COL_OPEN], errors="coerce")
     high = pd.to_numeric(df[COL_HIGH], errors="coerce")
     low = pd.to_numeric(df[COL_LOW], errors="coerce")
     volume = pd.to_numeric(df[COL_VOLUME], errors="coerce")
@@ -191,7 +195,13 @@ def compute_indicators(df, code: str = "") -> dict:
 
     # 涨跌幅利用率：涨跌幅 / 当日最大涨跌幅
     limit = board_max_limit(code, df)
-    lu = (close - prev_close) / (limit * prev_close)
+    denom = limit * prev_close          # 当日最大涨跌金额（归一化分母）
+    lu = (close - prev_close) / denom
+    # 隔夜消息利用率：今开相对昨收的跳空幅度（高开为正）
+    olu = (open_ - prev_close) / denom
+    # 看空利用率：收盘相对当日最高价的回落（<=0）；看多利用率：收盘相对最低价的反弹（>=0）
+    hlu = (close - high) / denom
+    llu = (close - low) / denom
 
     # 移动均值：窗口含当日，天数不足时为 NaN
     m21c = close.rolling(window=CLOSE_WINDOW, min_periods=CLOSE_WINDOW).mean()
@@ -208,10 +218,6 @@ def compute_indicators(df, code: str = "") -> dict:
     ).max(axis=1)
     atr = true_range / prev_close
 
-    # 看多 / 看空
-    nbull = (high - close) / close
-    nbear = (close - low) / close
-
     # 换手率（原始数据列；缺失时为空）
     if COL_TURNOVER in df.columns:
         tr = pd.to_numeric(df[COL_TURNOVER], errors="coerce")
@@ -220,7 +226,8 @@ def compute_indicators(df, code: str = "") -> dict:
 
     return {
         "close": close, "high": high, "low": low, "volume": volume,
-        "lu": lu, "m21c": m21c, "m21v": m21v,
+        "lu": lu, "olu": olu, "hlu": hlu, "llu": llu,
+        "m21c": m21c, "m21v": m21v,
         "nc": nc, "nv": nv, "atr": atr,
-        "nbull": nbull, "nbear": nbear, "tr": tr,
+        "tr": tr,
     }

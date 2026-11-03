@@ -21,59 +21,49 @@ st，*st，退市股票跳过，不生成预处理数据文件
   行业：
   收盘价：
   成交量：
-  LU：(C_{t}-C_{t-1})/(max_limit)*C_{t-1}，涨跌幅利用率，max_limit 该股票当天的最大涨幅，例如沪深主板最大涨跌幅 10%，创业板 20%，科创板 20%，北交所 30%等。注意沪深主板的 st 股票在 2026 年 7 月 6 日之前涨跌幅是 5%，现在涨跌幅是 10%。
+  LU：(C_{t}-C_{t-1})/(max_limit * C_{t-1})，涨跌幅利用率，max_limit 该股票当天的最大涨幅，例如沪深主板最大涨跌幅 10%，创业板 20%，科创板 20%，北交所 30%等。注意沪深主板的 st 股票在 2026 年 7 月 6 日之前涨跌幅是 5%，现在涨跌幅是 10%。
+  OLU：(O_{t}-C_{t-1})/(max_limit * C_{t-1})，隔夜消息利用率
+  HLU：(C_{t}-H_{t})/(max_limit * C_{t-1})，看空利用率
+  LLU：(C_{t}-L_{t})/(max_limit * C_{t-1})，看多利用率
+  M5C：5日收盘价均值
   M21C：21日收盘价均值
+  M60C：60日收盘价均值
   M21V：21日成交量均值
   NC：(收盘价-M21C)/M21C，归一化值。表示价格。
   NV：(成交量-M21V)/M21V，归一化值。表示成交量。
-  ATR：(max(H_{t}-L_{t},|H_{t}-C_{t-1}|,|L_{t}-C_{t-1}|))/C_{t-1}，单日真实波动率，考虑了隔夜跳空，归一化值。表示波动。
-  NBull：(最高价-收盘价)/收盘价，归一化值。表示看多。
-  NBear：(收盘价-最低价)/收盘价，归一化值。表示看空。
   TR：换手率
   IMV：行业成交量 / 大盘成交量。表示行业热度。
   SIV：个股成交量 / 行业成交量。表示个股在行业热度。
   峰值标签：T，B，N（列名沿用"峰值标签"，取值由三元屏蔽法给出）
 }
 
-峰值标签：使用三元屏蔽法（triple barrier），止盈标注 T，止损标注 B，其他标注无操作 N
+峰值标签：使用简化的三元屏蔽法（triple barrier），止盈标注 B（买入），止损标注 T（卖出），其他标注无操作 N
 preprocess.json 参数说明
 "label": {
-  "max_days": 21, // 观察天数
-  "price": "开盘价", // 收益计算使用的价格，profit_{k}=(O_{k+1}-O_{k})/O_{k}
-  "barrier_mode": "atr", // 屏障方式："fixed" 固定百分比 / "atr" 按波动率自适应
-  "take_profit": 0.15, // 固定止盈百分比（barrier_mode="fixed" 时使用）
-  "stop_loss": 0.1, // 固定止损百分比（barrier_mode="fixed" 时使用）
-  "atr_window": 21, // ATR 滚动均值窗口（barrier_mode="atr" 时使用）
-  "take_profit_atr": 3, // 止盈屏障 = take_profit_atr × ATR
-  "stop_loss_atr": 2, // 止损屏障 = stop_loss_atr × ATR
-  "min_take_profit": 0.06, // 止盈屏障下限（防止低波动股屏障过窄）
-  "max_take_profit": 0.3, // 止盈屏障上限
-  "min_stop_loss": 0.04, // 止损屏障下限
-  "max_stop_loss": 0.2, // 止损屏障上限
-  "same_day_priority": "stop_loss", // 同时触发优先标注止损
+  "take_profit" // 盈利：LU 累计值阈值
+  "take_profit_timeout" // 盈利时限
+  "stop_loss" // 亏损：LU 累计值阈值（正负号等价）
+  "stop_loss_timeout" // 亏损时限
   "values": {
-    "take_profit": "B", // 止盈标注
-    "stop_loss": "T", // 止损标注
-    "timeout": "N" // 无操作
+    "take_profit": // 止盈标注
+    "stop_loss": // 止损标注
+    "timeout": // 无操作
   }
 }
 
-波动率自适应屏障（barrier_mode="atr"）
-  ATR_pct[t] = 截至第 t 日的 atr_window 日滚动平均单日真实波动率（只用 t 及之前的数据）
-  take_profit_t = clip(take_profit_atr × ATR_pct[t], min_take_profit, max_take_profit)
-  stop_loss_t   = clip(stop_loss_atr   × ATR_pct[t], min_stop_loss,   max_stop_loss)
-  高波动股票屏障自动放宽、低波动股票收窄，避免固定百分比对不同波动股票的偏倚
-
 三元屏蔽标注实现（src/preprocess/label/triple_barrier.py）
-对第 t 个交易日：
-  1.入场价 = price[t]（默认开盘价）
-  2.依次取 k = 1..max_days，计算 profit_k = (price[t+k] - price[t]) / price[t]
+盈亏用涨跌幅利用率 LU 累加衡量（不用价格收益率，天然消除板块涨跌幅限制差异）：
+  对第 t 个交易日（入场 = 第 t 日收盘价），
+  1.profit_k = Σ LU[t+1..t+k]（k = 1..对应时限）
+  2.止盈：在 k = 1..take_profit_timeout（止盈时限，默认 21 日）内，
        profit_k >= take_profit → 止盈，标注 values.take_profit（B，买入）
-       profit_k <= -stop_loss  → 止损，标注 values.stop_loss（T，卖出）
-  3.先触发的一侧即为该日标签；max_days 内均未触发 → 标注 values.timeout（N）
-  4.同一个 k 同时越过两侧屏障（跳空等极端情形）→ 按 same_day_priority 决定
-  5.价格缺失或未来 max_days 个交易日数据不完整的行（含文件末尾 max_days 行）
-    标签为空，预处理阶段直接丢弃，避免用不完整的前瞻窗口训练
+  3.止损：在 k = 1..stop_loss_timeout（止损时限，默认 15 日）内，
+       profit_k <= -|stop_loss| → 止损，标注 values.stop_loss（T，卖出）
+     （stop_loss 配置写 -0.2 或 0.2 等价，均表示亏损 0.2 个 LU）
+  4.止盈 / 止损各自独立窗口，先触发的一侧生效；同一 k 同时触发时优先止损（保守）
+  5.其他标注为 N
+  6.末尾 max(take_profit_timeout, stop_loss_timeout) 个交易日的前瞻窗口不完整，
+    标签为空并丢弃；--update 比对时也不计入这些日期
 标签参数写入 preprocessed_data/.label_signature.json；参数变化时自动清理旧
 预处理文件后重新生成（--update 也生效）
 

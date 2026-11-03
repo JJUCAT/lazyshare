@@ -1,25 +1,19 @@
 # -*- coding: utf-8 -*-
-"""标签计算子包：三元屏蔽法（triple barrier）标签 T / B / N。"""
+"""标签计算子包：简单三元屏蔽（triple barrier）标签 B / T / N，盈亏用 LU 累加。"""
 from .triple_barrier import (
-    BARRIER_ATR,
-    BARRIER_FIXED,
-    BARRIER_MODES,
-    DEFAULT_PRICE_COLUMN,
     DEFAULT_VALUES,
     VALUE_KEYS,
-    barrier_levels,
     compute_triple_barrier_labels,
+    cumulative_lu,
+    label_lookahead,
     normalize_label_config,
 )
 
 __all__ = [
-    "BARRIER_ATR",
-    "BARRIER_FIXED",
-    "BARRIER_MODES",
-    "DEFAULT_PRICE_COLUMN",
     "DEFAULT_VALUES",
     "VALUE_KEYS",
-    "barrier_levels",
     "compute_triple_barrier_labels",
+    "cumulative_lu",
+    "label_lookahead",
     "normalize_label_config",
 ]
