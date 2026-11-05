@@ -23,10 +23,17 @@
     - roc_auc    : ROC-AUC（多分类 one-vs-rest，需 probas / P_* 概率列）
 另有 evaluate.accuracy_interval：对每个置信度阈值，统计"置信度 >= 阈值的标签占比"与"该子集精度"。
 
+另外总是输出「按类别」的 precision / recall / f1 / support；
+--min-conf 可以只统计置信度 >= 阈值的样本（如只看 conf>=0.9 的高置信子集）。
+
 用法：
     python3 src/train/evaluate.py <results.json 或 validation 模型文件夹>
-           [--config config/classify_train.json] [-o out.txt]
+           [--config config/classify_train.json] [--min-conf 0.9] [-o out.txt]
 未指定 -o 时，评分总结自动保存到 目标同目录/summary.log。
+
+示例（只看置信度 >= 90% 的样本，各标签指标）：
+    python3 src/train/evaluate.py \\
+        /Users/jucat/data/ashare/validation/<模型名>/test/results.json --min-conf 0.9
 """
 from __future__ import annotations
 
@@ -119,6 +126,42 @@ def build_matrix(samples: list[dict], classes: list[str]):
     return np.array(y_true), np.array(y_pred)
 
 
+def sample_conf(sample: dict, classes: list[str]) -> float | None:
+    """取样本的置信度：优先用 probas[预测类别]，缺失时用 conf 字段。"""
+    p = sample.get("probas")
+    pred = sample.get("pred")
+    if p and pred in classes:
+        idx = classes.index(pred)
+        if 0 <= idx < len(p):
+            try:
+                val = float(p[idx])
+                if np.isfinite(val):
+                    return val
+            except (TypeError, ValueError):
+                pass
+    conf = sample.get("conf")
+    if conf is None:
+        return None
+    try:
+        val = float(conf)
+    except (TypeError, ValueError):
+        return None
+    return val if np.isfinite(val) else None
+
+
+def filter_by_conf(samples: list[dict], classes: list[str],
+                   min_conf: float | None) -> list[dict]:
+    """只保留置信度 >= min_conf 的样本（min_conf 为 None 时原样返回）。"""
+    if min_conf is None:
+        return samples
+    kept = []
+    for s in samples:
+        conf = sample_conf(s, classes)
+        if conf is not None and conf >= min_conf:
+            kept.append(s)
+    return kept
+
+
 def build_probas(samples: list[dict], n_classes: int) -> np.ndarray:
     """从 samples 构造概率矩阵 (n, n_classes)。
 
@@ -156,7 +199,8 @@ def _score_samples(samples: list[dict], classes: list[str],
                    labels: list[str] | None = None,
                    model_name: str = "",
                    config_path: Path = DEFAULT_CONFIG,
-                   accuracy_intervals: list[float] | None = None) -> str:
+                   accuracy_intervals: list[float] | None = None,
+                   min_conf: float | None = None) -> str:
     """计算评分项，返回评分总结字符串。
 
     - samples: 逐日样本 {true, pred, probas, ...}
@@ -165,6 +209,7 @@ def _score_samples(samples: list[dict], classes: list[str],
     - labels: 评分时只考虑的标签（true 与 pred 均在其中才计入）；
               为 None 时读取配置 evaluate.labels；空列表表示不限制。
     - accuracy_intervals: 置信度阈值列表；为 None 时读取配置 evaluate.accuracy_interval。
+    - min_conf: 只用置信度 >= min_conf 的样本评分；None 表示不筛选。
     """
     if metrics is None or labels is None or accuracy_intervals is None:
         _metrics, _labels, _intervals = _load_evaluate_config(config_path)
@@ -174,6 +219,15 @@ def _score_samples(samples: list[dict], classes: list[str],
             labels = _labels
         if accuracy_intervals is None:
             accuracy_intervals = _intervals
+
+    # 置信度筛选（只看高置信子集，如 --min-conf 0.9）
+    if min_conf is not None:
+        total_before = len(samples)
+        samples = filter_by_conf(samples, classes, min_conf)
+        if not samples:
+            return (f"模型: {model_name}\n"
+                    f"置信度阈值: >= {min_conf}（原 {total_before} 个样本，筛选后 0 个）\n"
+                    f"无符合条件的样本")
 
     # 只对指定 labels 中的样本评分（true 与 pred 均需命中）
     if labels:
@@ -213,6 +267,8 @@ def _score_samples(samples: list[dict], classes: list[str],
              f"类别: {classes}"]
     if labels:
         lines.append(f"评分标签: {labels}")
+    if min_conf is not None:
+        lines.append(f"置信度筛选: >= {min_conf}")
     lines.append(f"样本数: {len(samples)}")
     for m in metrics:
         key = m.strip().lower()
@@ -242,6 +298,30 @@ def _score_samples(samples: list[dict], classes: list[str],
         except Exception as exc:  # noqa: BLE001
             lines.append(f"{m}: 计算失败 ({exc})")
 
+    # 按类别的 precision / recall / f1（support 为真实样本数，预测数为该类的预测数）
+    try:
+        p_cls = precision_score(y_true, y_pred, labels=list(range(n_classes)),
+                                average=None, zero_division=0)
+        r_cls = recall_score(y_true, y_pred, labels=list(range(n_classes)),
+                             average=None, zero_division=0)
+        f_cls = f1_score(y_true, y_pred, labels=list(range(n_classes)),
+                         average=None, zero_division=0)
+        lines.append("")
+        lines.append("== 按类别指标 ==")
+        lines.append(f"{'类别':<6}{'support':>9}{'预测数':>9}{'precision':>11}{'recall':>9}{'f1':>9}")
+        for i, c in enumerate(eval_classes):
+            support = int((y_true == i).sum())
+            pred_n = int((y_pred == i).sum())
+            lines.append(f"{c:<6}{support:>9}{pred_n:>9}{p_cls[i]:>11.4f}"
+                         f"{r_cls[i]:>9.4f}{f_cls[i]:>9.4f}")
+        macro_p = float(np.mean(p_cls)) if n_classes else 0.0
+        macro_r = float(np.mean(r_cls)) if n_classes else 0.0
+        macro_f = float(np.mean(f_cls)) if n_classes else 0.0
+        lines.append(f"{'macro':<6}{len(y_true):>9}{len(y_pred):>9}{macro_p:>11.4f}"
+                     f"{macro_r:>9.4f}{macro_f:>9.4f}")
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"按类别指标计算失败: {exc}")
+
     # accuracy_interval：各置信度阈值的标签占比与精度
     if accuracy_intervals:
         c2i = {c: i for i, c in enumerate(classes)}
@@ -269,7 +349,8 @@ def _score_samples(samples: list[dict], classes: list[str],
 def evaluate_results(results_path: Path, metrics: list[str] | None = None,
                      labels: list[str] | None = None,
                      config_path: Path = DEFAULT_CONFIG,
-                     accuracy_intervals: list[float] | None = None) -> str:
+                     accuracy_intervals: list[float] | None = None,
+                     min_conf: float | None = None) -> str:
     """从 results.json 计算评分项，返回评分总结字符串。"""
     results = load_results(results_path)
     classes = list(results.get("classes") or [])
@@ -279,13 +360,15 @@ def evaluate_results(results_path: Path, metrics: list[str] | None = None,
     return _score_samples(samples, classes, metrics, labels,
                           model_name=str(results.get("model", "")),
                           config_path=config_path,
-                          accuracy_intervals=accuracy_intervals)
+                          accuracy_intervals=accuracy_intervals,
+                          min_conf=min_conf)
 
 
 def evaluate_from_csv(root: Path, metrics: list[str] | None = None,
                       labels: list[str] | None = None,
                       config_path: Path = DEFAULT_CONFIG,
-                      accuracy_intervals: list[float] | None = None) -> str:
+                      accuracy_intervals: list[float] | None = None,
+                      min_conf: float | None = None) -> str:
     """遍历 validation 目录下 csv 文件，计算评分项，返回评分总结字符串。"""
     samples, classes = collect_samples_from_csv(root)
     if not samples:
@@ -296,7 +379,8 @@ def evaluate_from_csv(root: Path, metrics: list[str] | None = None,
     return _score_samples(samples, classes, metrics, labels,
                           model_name=str(Path(root).name),
                           config_path=config_path,
-                          accuracy_intervals=accuracy_intervals)
+                          accuracy_intervals=accuracy_intervals,
+                          min_conf=min_conf)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -306,17 +390,37 @@ def main(argv: list[str] | None = None) -> int:
                         help="results.json 路径，或 validation 模型文件夹路径")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG,
                         help="配置文件路径（默认: config/classify_train.json）")
+    parser.add_argument("--min-conf", type=float, default=None, metavar="X",
+                        help="只统计置信度 >= X 的样本（如 0.9 表示只看 >=90%% 的高置信样本）")
+    parser.add_argument("--labels", default=None, metavar="LIST",
+                        help="覆盖配置 evaluate.labels，如 B,N,T；传 all 表示不筛选标签")
     parser.add_argument("-o", "--output", type=Path, default=None,
                         help="评分总结输出文件路径（默认打印到 stdout）")
     args = parser.parse_args(argv)
+    if args.min_conf is not None and not 0.0 <= args.min_conf <= 1.0:
+        raise SystemExit(f"--min-conf 必须在 [0, 1] 之间，当前 {args.min_conf}")
+
+    # --labels 覆盖配置的 evaluate.labels；all / 空串 表示不筛选标签（统计全部类别）
+    labels_arg: list[str] | None = None
+    if args.labels is not None:
+        raw = str(args.labels).strip()
+        if raw.lower() in ("all", "*", "全部"):
+            labels_arg = []
+        else:
+            labels_arg = [x.strip() for x in raw.split(",") if x.strip()]
 
     target = args.target
+    suffix = "" if args.min_conf is None else f".conf{args.min_conf:g}"
     if target.is_dir():
-        summary = evaluate_from_csv(target, config_path=args.config)
-        default_out = target / "summary.log"
+        summary = evaluate_from_csv(target, labels=labels_arg,
+                                    config_path=args.config,
+                                    min_conf=args.min_conf)
+        default_out = target / f"summary{suffix}.log"
     else:
-        summary = evaluate_results(target, config_path=args.config)
-        default_out = target.parent / "summary.log"
+        summary = evaluate_results(target, labels=labels_arg,
+                                   config_path=args.config,
+                                   min_conf=args.min_conf)
+        default_out = target.parent / f"summary{suffix}.log"
 
     print(summary)
     if args.output is None:

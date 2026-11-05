@@ -6,22 +6,27 @@
     OLU  = (O_t - C_{t-1}) / (max_limit * C_{t-1})   隔夜消息利用率（高开为正）
     HLU  = (C_t - H_t)     / (max_limit * C_{t-1})   看空利用率（收盘相对最高价回落，<=0）
     LLU  = (C_t - L_t)     / (max_limit * C_{t-1})   看多利用率（收盘相对最低价反弹，>=0）
+    M5C  = 5 日收盘价均值    （后处理价格过滤用，不进特征）
     M21C = 21 日收盘价均值
+    M60C = 60 日收盘价均值   （后处理价格过滤用，不进特征）
     M21V = 21 日成交量均值
-    NC   = (C - M21C) / M21C                          价格（归一化）
-    NV   = (V - M21V) / M21V                          成交量（归一化）
     ATR  = max(H-L, |H-C_{t-1}|, |L-C_{t-1}|) / C_{t-1} 单日真实波动率（归一化）
     TR   = 换手率
     IMV  = 行业成交量 / 大盘成交量                     行业热度
     SIV  = 个股成交量 / 行业成交量                     个股在行业中的热度
+
+注意：M5C / M60C 只用于 postprocess（对推理结果按收盘价与均线关系二次过滤），
+不作为切片特征，见 src/train/slice.py。
 """
 from __future__ import annotations
 
 import pandas as pd
 
 # 计算窗口（含当日）
-CLOSE_WINDOW = 21    # M21C：21 日收盘价均值
-VOLUME_WINDOW = 21   # M21V：21 日成交量均值
+CLOSE_WINDOW_SHORT = 5   # M5C：5 日收盘价均值（后处理过滤用）
+CLOSE_WINDOW = 21        # M21C：21 日收盘价均值
+CLOSE_WINDOW_LONG = 60   # M60C：60 日收盘价均值（后处理过滤用）
+VOLUME_WINDOW = 21       # M21V：21 日成交量均值
 
 # 跳过上市后前 N 个交易日（该区间涨跌幅不受限制，LU 无意义）
 IPO_SKIP_DAYS = 5
@@ -75,10 +80,10 @@ OUTPUT_COLUMNS = [
     "OLU",
     "HLU",
     "LLU",
+    "M5C",
     "M21C",
+    "M60C",
     "M21V",
-    "NC",
-    "NV",
     "ATR",
     "TR",
     "IMV",
@@ -94,10 +99,10 @@ FLOAT_COLUMNS = [
     "OLU",
     "HLU",
     "LLU",
+    "M5C",
     "M21C",
+    "M60C",
     "M21V",
-    "NC",
-    "NV",
     "ATR",
     "TR",
     "IMV",
@@ -181,10 +186,10 @@ def is_skipped_stock(df) -> bool:
 
 
 def compute_indicators(df, code: str = "") -> dict:
-    """计算各项指标序列（LU/OLU/HLU/LLU / 均值 / 归一化 / 波动 / 换手率）。
+    """计算各项指标序列（LU/OLU/HLU/LLU / 均价 / 归一化 / 波动 / 换手率）。
 
     返回 dict，键为：close / high / low / volume / lu / olu / hlu / llu /
-    m21c / m21v / nc / nv / atr / tr。
+    m5c / m21c / m60c / m21v / atr / tr。
     """
     close = pd.to_numeric(df[COL_CLOSE], errors="coerce")
     open_ = pd.to_numeric(df[COL_OPEN], errors="coerce")
@@ -204,12 +209,12 @@ def compute_indicators(df, code: str = "") -> dict:
     llu = (close - low) / denom
 
     # 移动均值：窗口含当日，天数不足时为 NaN
+    m5c = close.rolling(window=CLOSE_WINDOW_SHORT,
+                        min_periods=CLOSE_WINDOW_SHORT).mean()
     m21c = close.rolling(window=CLOSE_WINDOW, min_periods=CLOSE_WINDOW).mean()
+    m60c = close.rolling(window=CLOSE_WINDOW_LONG,
+                         min_periods=CLOSE_WINDOW_LONG).mean()
     m21v = volume.rolling(window=VOLUME_WINDOW, min_periods=VOLUME_WINDOW).mean()
-
-    # 归一化值（以收盘价为基准）
-    nc = (close - m21c) / m21c
-    nv = (volume - m21v) / m21v
 
     # 单日真实波动率：考虑隔夜跳空
     true_range = pd.concat(
@@ -227,7 +232,7 @@ def compute_indicators(df, code: str = "") -> dict:
     return {
         "close": close, "high": high, "low": low, "volume": volume,
         "lu": lu, "olu": olu, "hlu": hlu, "llu": llu,
-        "m21c": m21c, "m21v": m21v,
-        "nc": nc, "nv": nv, "atr": atr,
+        "m5c": m5c, "m21c": m21c, "m60c": m60c, "m21v": m21v,
+        "atr": atr,
         "tr": tr,
     }

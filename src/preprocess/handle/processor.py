@@ -157,10 +157,11 @@ def process_file(task: tuple[Path, Path]) -> dict:
             "OLU": ind["olu"],
             "HLU": ind["hlu"],
             "LLU": ind["llu"],
+            # M5C / M60C 供 postprocess 价格过滤使用，不作为切片特征
+            "M5C": ind["m5c"],
             "M21C": ind["m21c"],
+            "M60C": ind["m60c"],
             "M21V": ind["m21v"],
-            "NC": ind["nc"],
-            "NV": ind["nv"],
             "ATR": ind["atr"],
             "TR": ind["tr"],
             "IMV": imv,
@@ -248,7 +249,7 @@ def needs_update(raw_file: Path, out_dir: Path, lookahead: int = 0) -> bool:
                 di = header.index("日期")
             except ValueError:
                 return True
-            # 列结构（新增 LU/ATR/TR、移除 NA/SNC/SNV/SNB/M21SNB）变化时需重新生成
+            # 列结构（新增 M5C/M60C 等）变化时需重新生成
             if list(header) != list(OUTPUT_COLUMNS):
                 return True
             for row in reader:

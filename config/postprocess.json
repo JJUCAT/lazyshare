@@ -1,0 +1,15 @@
+{
+  "data_source": "/Users/jucat/data/ashare/preprocessed",
+  "validation": "/Users/jucat/data/ashare/validation",
+  "models": "/Users/jucat/data/ashare/models",
+
+  "price_col": "收盘价",
+  "ma_col": "M5C",
+
+  "labels": {
+    "buy": "B",
+    "sell": "T"
+  },
+
+  "min_conf": null
+}

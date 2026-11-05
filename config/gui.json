@@ -11,17 +11,29 @@
           {
             "column": "成交量",
             "side": "right"
+          },
+          {
+            "column": "M21C",
+            "side": "left"
+          },
+          {
+            "column": "M5C",
+            "side": "left"
+          },
+          {
+            "column": "M60C",
+            "side": "left"
           }
         ]
       },
       {
         "series": [
           {
-            "column": "NC",
+            "column": "ATR",
             "side": "left"
           },
           {
-            "column": "NV",
+            "column": "TR",
             "side": "right"
           }
         ]

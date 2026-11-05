@@ -23,7 +23,10 @@
        - jump_step > seq_len：窗口间留有空隙，同样不重叠；
        - throw_last_one=false 会补一个以文件最后一天收尾的窗口（起点
          len-seq_len），它与前面的平铺窗口尾部重叠，故被禁止。
-    6. 收益滤波器（income_filter）：对每个窗口样本，若窗口内不存在任意一个
+    6. 后处理专用列（M5C / M60C）不参与切片：它们只在 postprocess 阶段用于
+       "收盘价 vs 均线"的买卖信号过滤，作为特征会改变模型输入口径，故配置
+       slice.items 中不允许出现，见 POSTPROCESS_ONLY_COLS。
+    7. 收益滤波器（income_filter）：对每个窗口样本，若窗口内不存在任意一个
        "B 标签在前、T 标签在后"的组合，满足
        - B 日到 T 日相差 <= income_filter.time 个时间节点，
        - 收盘价从 B 日到 T 日涨幅 >= income_filter.increase，
@@ -54,6 +57,9 @@ if str(PROJECT_ROOT) not in sys.path:
 DATE_COL = "日期"
 CLOSE_COL = "收盘价"  # 收益滤波器需要源数据中的收盘价
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "classify_train.json"
+
+# 仅供后处理（postprocess）价格过滤使用的列，不能作为切片特征
+POSTPROCESS_ONLY_COLS = ("M5C", "M60C")
 
 
 def load_train_config(config_path: Path) -> dict:
@@ -94,6 +100,12 @@ def load_train_config(config_path: Path) -> dict:
     label = (slice_cfg.get("label") or cfg.get("label") or ["峰值标签"])[0]
     if not items:
         raise ValueError("items 未配置")
+    # M5C / M60C 是后处理专用列（收盘价 vs 均线过滤），不进入模型特征
+    bad = [c for c in POSTPROCESS_ONLY_COLS if c in items]
+    if bad:
+        raise ValueError(
+            f"slice.items 不能包含后处理专用列 {bad}：M5C / M60C 只用于 "
+            f"postprocess 的价格过滤（见 src/postprocess），不参与切片特征")
     if DATE_COL not in items:
         items = [DATE_COL] + items  # 保证日期列参与输出，但不作为数值特征
     if seq_len <= 0 or jump_step <= 0:

@@ -7,11 +7,7 @@
       "OLU",
       "HLU",
       "LLU",
-      "NC",
-      "NV",
-      "TR",
-      "IMV",
-      "SIV"
+      "TR"
     ],
     "label": [
       "峰值标签"
@@ -43,8 +39,8 @@
     },
     "purge_days": 21,
     "loss_label_weight": {
-      "T": 2.0,
-      "B": 3.0,
+      "T": 1.0,
+      "B": 1.0,
       "N": 1.0
     },
     "decision_weight": "none",

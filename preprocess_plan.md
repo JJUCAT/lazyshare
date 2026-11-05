@@ -5,6 +5,8 @@ preprocess 实现：
   "raw_data"：原始数据路径
   "preprocessed_data"：预处理数据路径
   "weather"：行业成交量，大盘成交量
+  "postprocess"：{"enabled": true/false}，是否启用后处理对模型推理结果的过滤
+                 （关闭时只做验证/测试指标评测，见 postprocess_plan.md）
   "label"：三元屏蔽（止盈 / 止损 / 时限）参数，见下文“label 配置参数说明”
 4.scripts/preprocess.py：启动预处理
 
@@ -29,8 +31,6 @@ st，*st，退市股票跳过，不生成预处理数据文件
   M21C：21日收盘价均值
   M60C：60日收盘价均值
   M21V：21日成交量均值
-  NC：(收盘价-M21C)/M21C，归一化值。表示价格。
-  NV：(成交量-M21V)/M21V，归一化值。表示成交量。
   TR：换手率
   IMV：行业成交量 / 大盘成交量。表示行业热度。
   SIV：个股成交量 / 行业成交量。表示个股在行业热度。
