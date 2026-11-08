@@ -49,12 +49,11 @@ config/classify_train.json 时序分类任务训练的配置
     "roc_auc"
   ],
 
-  "accuracy_interval": [
-    0.99,
-    0.95,
+  "confidence_interval": [ // 置信度分档阈值：每档按 items 输出指标，并按 labels 输出逐标签指标
     0.90,
-    0.85,
-    0.80
+    0.80,
+    0.65,
+    0.50
   ],
 
   "weather": { // 大盘交易行情概况

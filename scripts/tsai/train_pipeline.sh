@@ -20,9 +20,7 @@
 #
 # 参数:
 #   --config <路径>       训练配置（默认 config/classify_train.json）
-#   --postprocess-config <路径>  后处理配置（默认 config/postprocess.json）
-#   --preprocess-config <路径>   预处理配置（读取 postprocess.enabled 开关，
-#                                 默认 config/preprocess.json）
+#   --postprocess-config <路径>  后处理配置（含 enabled 开关，默认 config/postprocess.json）
 #   --mail-config <路径>  邮件配置（默认 config/mail.json）
 #   --epochs/--limit/--dirs <N>   透传给 src/train/train.py
 #   --dry-run             邮件只打印不发送
@@ -44,7 +42,6 @@ MAIL_PY="${PROJECT_ROOT}/scripts/mail_report.py"
 
 CONFIG="${PROJECT_ROOT}/config/classify_train.json"
 POSTPROCESS_CONFIG="${PROJECT_ROOT}/config/postprocess.json"
-PREPROCESS_CONFIG="${PROJECT_ROOT}/config/preprocess.json"
 MAIL_CONFIG="${PROJECT_ROOT}/config/mail.json"
 DRY_RUN=0
 NO_MAIL=0
@@ -56,7 +53,6 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --config)       CONFIG="$2"; shift 2 ;;
         --postprocess-config) POSTPROCESS_CONFIG="$2"; shift 2 ;;
-        --preprocess-config) PREPROCESS_CONFIG="$2"; shift 2 ;;
         --mail-config)  MAIL_CONFIG="$2"; shift 2 ;;
         --epochs|--limit|--dirs) TRAIN_ARGS+=("$1" "$2"); shift 2 ;;
         --dry-run)      DRY_RUN=1; shift ;;
@@ -126,17 +122,22 @@ if [[ -z "${MODEL_NAME}" ]]; then
 fi
 
 # 4. 后处理：按 M5C 过滤 B / T 信号并重新评估（与验证/测试同一套指标）
-#    开关：预处理配置的 postprocess.enabled（缺省 true）。
+#    开关：每次运行实时读取后处理配置的 enabled（缺省 true）。
 #    关闭时跳过过滤，验证/测试的分类指标与推理结果保持不变。
 echo "==== [3/4] 后处理（M5C 过滤 B/T 信号） ===="
 PP_ENABLED=1
-if [[ -f "${PREPROCESS_CONFIG}" ]]; then
-    if ! python3 - "${PREPROCESS_CONFIG}" <<'PY'
+if [[ -f "${POSTPROCESS_CONFIG}" ]]; then
+    if ! python3 - "${POSTPROCESS_CONFIG}" <<'PY'
 import json, sys
 from pathlib import Path
 cfg = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-flag = cfg.get("postprocess", True)
-enabled = flag if isinstance(flag, bool) else bool(flag.get("enabled", True))
+flag = cfg.get("enabled", True)
+if isinstance(flag, str):
+    enabled = flag.strip().lower() not in ("0", "false", "no", "off")
+elif isinstance(flag, dict):
+    enabled = bool(flag.get("enabled", True))
+else:
+    enabled = bool(flag)
 sys.exit(0 if enabled else 1)
 PY
     then
@@ -145,10 +146,9 @@ PY
 fi
 if [[ ${PP_ENABLED} -eq 1 ]]; then
     python "${POSTPROCESS_PY}" --config "${POSTPROCESS_CONFIG}" \
-        --preprocess-config "${PREPROCESS_CONFIG}" \
         --model "${MODELS_DIR}/${MODEL_NAME}.pkl" --split all ${V_FLAG[@]+"${V_FLAG[@]}"}
 else
-    echo "  已关闭（${PREPROCESS_CONFIG} 的 postprocess.enabled=false），跳过过滤"
+    echo "  已关闭（${POSTPROCESS_CONFIG} 的 enabled=false），跳过过滤"
 fi
 
 REPORTS=(

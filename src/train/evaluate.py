@@ -21,7 +21,8 @@
     - recall     : 召回率（多分类 weighted）
     - f1_score   : F1（多分类 weighted）
     - roc_auc    : ROC-AUC（多分类 one-vs-rest，需 probas / P_* 概率列）
-另有 evaluate.accuracy_interval：对每个置信度阈值，统计"置信度 >= 阈值的标签占比"与"该子集精度"。
+另有 evaluate.confidence_interval：对每个置信度阈值，按 evaluate.items 输出
+该子集的分类指标，并按 evaluate.labels 输出逐标签 precision / recall / f1。
 
 另外总是输出「按类别」的 precision / recall / f1 / support；
 --min-conf 可以只统计置信度 >= 阈值的样本（如只看 conf>=0.9 的高置信子集）。
@@ -48,6 +49,8 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.train.report import confidence_table  # noqa: E402
 
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "classify_train.json"
 
@@ -182,7 +185,7 @@ def build_probas(samples: list[dict], n_classes: int) -> np.ndarray:
 
 
 def _load_evaluate_config(config_path: Path):
-    """读取配置 evaluate 结构，返回 (metrics, labels, accuracy_intervals)。"""
+    """读取配置 evaluate 结构，返回 (metrics, labels, confidence_intervals)。"""
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
     evaluate_cfg = cfg.get("evaluate") or {}
@@ -190,7 +193,7 @@ def _load_evaluate_config(config_path: Path):
         evaluate_cfg = {"items": evaluate_cfg, "labels": []}
     metrics = [str(x) for x in (evaluate_cfg.get("items") or [])]
     labels = [str(x) for x in (evaluate_cfg.get("labels") or [])]
-    intervals = [float(x) for x in (evaluate_cfg.get("accuracy_interval") or [])]
+    intervals = [float(x) for x in (evaluate_cfg.get("confidence_interval") or [])]
     return metrics, labels, intervals
 
 
@@ -199,7 +202,7 @@ def _score_samples(samples: list[dict], classes: list[str],
                    labels: list[str] | None = None,
                    model_name: str = "",
                    config_path: Path = DEFAULT_CONFIG,
-                   accuracy_intervals: list[float] | None = None,
+                   confidence_intervals: list[float] | None = None,
                    min_conf: float | None = None) -> str:
     """计算评分项，返回评分总结字符串。
 
@@ -208,17 +211,17 @@ def _score_samples(samples: list[dict], classes: list[str],
     - metrics: 评分项列表；为 None 时读取配置 evaluate.items
     - labels: 评分时只考虑的标签（true 与 pred 均在其中才计入）；
               为 None 时读取配置 evaluate.labels；空列表表示不限制。
-    - accuracy_intervals: 置信度阈值列表；为 None 时读取配置 evaluate.accuracy_interval。
+    - confidence_intervals: 置信度阈值列表；为 None 时读取配置 evaluate.confidence_interval。
     - min_conf: 只用置信度 >= min_conf 的样本评分；None 表示不筛选。
     """
-    if metrics is None or labels is None or accuracy_intervals is None:
+    if metrics is None or labels is None or confidence_intervals is None:
         _metrics, _labels, _intervals = _load_evaluate_config(config_path)
         if metrics is None:
             metrics = _metrics
         if labels is None:
             labels = _labels
-        if accuracy_intervals is None:
-            accuracy_intervals = _intervals
+        if confidence_intervals is None:
+            confidence_intervals = _intervals
 
     # 置信度筛选（只看高置信子集，如 --min-conf 0.9）
     if min_conf is not None:
@@ -322,34 +325,24 @@ def _score_samples(samples: list[dict], classes: list[str],
     except Exception as exc:  # noqa: BLE001
         lines.append(f"按类别指标计算失败: {exc}")
 
-    # accuracy_interval：各置信度阈值的标签占比与精度
-    if accuracy_intervals:
-        c2i = {c: i for i, c in enumerate(classes)}
-        for thr in accuracy_intervals:
-            total = 0
-            correct = 0
-            for s in samples:
-                p = s.get("probas")
-                pred = s.get("pred")
-                if p and pred in c2i:
-                    idx = c2i[pred]
-                    conf = float(p[idx]) if 0 <= idx < len(p) else None
-                else:
-                    conf = s.get("conf")
-                if conf is not None and np.isfinite(conf) and conf >= thr:
-                    total += 1
-                    if s["true"] == s["pred"]:
-                        correct += 1
-            ratio = total / len(samples) if samples else 0.0
-            acc = correct / total if total else 0.0
-            lines.append(f"[{thr}] 占比 {ratio:.2%}（{total}/{len(samples)}），精度 {acc:.4f}")
+    # confidence_interval：各置信度分档的 evaluate.items 指标与逐标签指标
+    if confidence_intervals:
+        confs = [sample_conf(s, classes) for s in samples]
+        yt_labels = [eval_classes[i] for i in y_true]
+        yp_labels = [eval_classes[i] for i in y_pred]
+        lines.append("")
+        lines.append("== 置信度分档指标（conf = 被预测类别的概率；指标同 evaluate.items） ==")
+        lines += confidence_table(
+            yt_labels, yp_labels, probas, eval_classes,
+            intervals=confidence_intervals, metrics=metrics,
+            labels=eval_classes, confs=confs)
     return "\n".join(lines)
 
 
 def evaluate_results(results_path: Path, metrics: list[str] | None = None,
                      labels: list[str] | None = None,
                      config_path: Path = DEFAULT_CONFIG,
-                     accuracy_intervals: list[float] | None = None,
+                     confidence_intervals: list[float] | None = None,
                      min_conf: float | None = None) -> str:
     """从 results.json 计算评分项，返回评分总结字符串。"""
     results = load_results(results_path)
@@ -360,14 +353,14 @@ def evaluate_results(results_path: Path, metrics: list[str] | None = None,
     return _score_samples(samples, classes, metrics, labels,
                           model_name=str(results.get("model", "")),
                           config_path=config_path,
-                          accuracy_intervals=accuracy_intervals,
+                          confidence_intervals=confidence_intervals,
                           min_conf=min_conf)
 
 
 def evaluate_from_csv(root: Path, metrics: list[str] | None = None,
                       labels: list[str] | None = None,
                       config_path: Path = DEFAULT_CONFIG,
-                      accuracy_intervals: list[float] | None = None,
+                      confidence_intervals: list[float] | None = None,
                       min_conf: float | None = None) -> str:
     """遍历 validation 目录下 csv 文件，计算评分项，返回评分总结字符串。"""
     samples, classes = collect_samples_from_csv(root)
@@ -379,7 +372,7 @@ def evaluate_from_csv(root: Path, metrics: list[str] | None = None,
     return _score_samples(samples, classes, metrics, labels,
                           model_name=str(Path(root).name),
                           config_path=config_path,
-                          accuracy_intervals=accuracy_intervals,
+                          confidence_intervals=confidence_intervals,
                           min_conf=min_conf)
 
 

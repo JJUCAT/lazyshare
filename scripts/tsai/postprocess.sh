@@ -10,9 +10,9 @@
 #   bash scripts/tsai/postprocess.sh --force               # 忽略开关强制过滤
 #
 # 说明:
-#   - 读取独立的 config/postprocess.json（data_source / validation / models /
-#     price_col / ma_col / labels / min_conf），与训练配置解耦
-#   - 开关在 config/preprocess.json 的 "postprocess": { "enabled": true }；
+#   - 读取独立的 config/postprocess.json（enabled / data_source / validation /
+#     models / price_col / ma_col / labels / min_conf），与训练配置解耦
+#   - 开关为 config/postprocess.json 的 "enabled"（每次运行实时读取）；
 #     关闭时直接跳过，不影响推理结果与验证/测试分类指标
 #   - 功能实现在 src/postprocess/postprocess.py
 #   - 仅依赖 pandas / numpy / scikit-learn（无需 tsai 环境）

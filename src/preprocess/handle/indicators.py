@@ -12,6 +12,10 @@
     M21V = 21 日成交量均值
     ATR  = max(H-L, |H-C_{t-1}|, |L-C_{t-1}|) / C_{t-1} 单日真实波动率（归一化）
     TR   = 换手率
+    LNV  = ln(1 + V_t)                                 对数平滑后的成交量
+    W21LNV = 2(lnv_t - min_left)/(max_left - min_center) - 1
+            成交量位置：min_left/max_left 取 [t-w, t]（w=21 日，含当日），
+            min_center 取居中窗口 [t-w/2, t+w/2]（共 21 个交易日）
     IMV  = 行业成交量 / 大盘成交量                     行业热度
     SIV  = 个股成交量 / 行业成交量                     个股在行业中的热度
 
@@ -20,6 +24,7 @@
 """
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 # 计算窗口（含当日）
@@ -27,6 +32,7 @@ CLOSE_WINDOW_SHORT = 5   # M5C：5 日收盘价均值（后处理过滤用）
 CLOSE_WINDOW = 21        # M21C：21 日收盘价均值
 CLOSE_WINDOW_LONG = 60   # M60C：60 日收盘价均值（后处理过滤用）
 VOLUME_WINDOW = 21       # M21V：21 日成交量均值
+LNV_WINDOW = 21          # W21LNV：左窗口 [t-20, t] 与居中窗口 [t-10, t+10]
 
 # 跳过上市后前 N 个交易日（该区间涨跌幅不受限制，LU 无意义）
 IPO_SKIP_DAYS = 5
@@ -86,6 +92,8 @@ OUTPUT_COLUMNS = [
     "M21V",
     "ATR",
     "TR",
+    "LNV",
+    "W21LNV",
     "IMV",
     "SIV",
     "峰值标签",
@@ -105,6 +113,8 @@ FLOAT_COLUMNS = [
     "M21V",
     "ATR",
     "TR",
+    "LNV",
+    "W21LNV",
     "IMV",
     "SIV",
 ]
@@ -188,8 +198,9 @@ def is_skipped_stock(df) -> bool:
 def compute_indicators(df, code: str = "") -> dict:
     """计算各项指标序列（LU/OLU/HLU/LLU / 均价 / 归一化 / 波动 / 换手率）。
 
-    返回 dict，键为：close / high / low / volume / lu / olu / hlu / llu /
-    m5c / m21c / m60c / m21v / atr / tr。
+    返回 dict，键为：open / close / high / low / volume / lu / olu / hlu /
+    llu / m5c / m21c / m60c / m21v / atr / tr / lnv / w21lnv。
+    open / close 供三元屏蔽标签按 label.price 选取入场价。
     """
     close = pd.to_numeric(df[COL_CLOSE], errors="coerce")
     open_ = pd.to_numeric(df[COL_OPEN], errors="coerce")
@@ -229,10 +240,28 @@ def compute_indicators(df, code: str = "") -> dict:
     else:
         tr = pd.Series(float("nan"), index=df.index, dtype=float)
 
+    # 对数平滑成交量 LNV = ln(1 + V_t)
+    lnv = np.log1p(volume.clip(lower=0))
+    # W21LNV（w = LNV_WINDOW = 21）：
+    #   w21lnv = 2 * (lnv - min_left) / (max_left - min_center) - 1
+    #   min_left / max_left：左窗口 [t-w, t]（含当日，共 w 个交易日）
+    #   min_center        ：居中窗口 [t-w/2, t+w/2]（共 w 个交易日）
+    # 分母为 0（窗口内 lnv 恒定）时取 0，避免除零。
+    left_min = lnv.rolling(window=LNV_WINDOW, min_periods=LNV_WINDOW).min()
+    left_max = lnv.rolling(window=LNV_WINDOW, min_periods=LNV_WINDOW).max()
+    center_min = lnv.rolling(window=LNV_WINDOW, min_periods=LNV_WINDOW,
+                             center=True).min()
+    denom = left_max - center_min
+    valid_denom = denom != 0
+    w21lnv = 2.0 * (lnv - left_min) / denom.where(valid_denom) - 1.0
+    w21lnv = w21lnv.where(valid_denom, 0.0)
+
     return {
-        "close": close, "high": high, "low": low, "volume": volume,
+        "open": open_, "close": close,
+        "high": high, "low": low, "volume": volume,
         "lu": lu, "olu": olu, "hlu": hlu, "llu": llu,
         "m5c": m5c, "m21c": m21c, "m60c": m60c, "m21v": m21v,
         "atr": atr,
         "tr": tr,
+        "lnv": lnv, "w21lnv": w21lnv,
     }

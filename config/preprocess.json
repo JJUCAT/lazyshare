@@ -3,14 +3,12 @@
   "preprocessed_data": "/Users/jucat/data/ashare/preprocessed",
   "tasks": "/Users/jucat/data/ashare/preprocessed/tasks",
   "weather": "/Users/jucat/data/ashare/share/weather.csv",
-  "postprocess": {
-    "enabled": true
-  },
   "label": {
-    "take_profit": 0.5,
-    "take_profit_timeout": 5,
-    "stop_loss": -0.4,
-    "stop_loss_timeout": 5,
+    "price": "open",
+    "take_profit": 10.0,
+    "take_profit_timeout": 15,
+    "stop_loss": -8.0,
+    "stop_loss_timeout": 10,
     "values": {
       "take_profit": "B",
       "stop_loss": "T",

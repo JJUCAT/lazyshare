@@ -1,35 +1,36 @@
 # -*- coding: utf-8 -*-
-"""标签计算：简单三元屏蔽（triple barrier）标签 B / T / N，盈亏用 LU（涨跌幅利用率）累加。
-
-LU = (C_t - C_{t-1}) / (max_limit × C_{t-1})，即当日涨跌幅占该股票当日最大涨跌幅
-的比例（详见 src/preprocess/handle/indicators.py）。用 LU 累加衡量盈亏，天然消除
-板块涨跌幅限制差异与个股波动差异（不同板块/ST 的 LU 可比较）。
+"""标签计算：三元屏蔽（triple barrier）标签 B / T / N，盈亏按价格涨跌幅百分比计算。
 
 参数定义见 preprocess_plan.md 的 "label" 段（config/preprocess.json）：
 
-    take_profit           盈利阈值（LU 累计值，正数，如 0.15）
-    take_profit_timeout   止盈时限（在 k = 1..take_profit_timeout 内检查）
-    stop_loss             亏损阈值（LU 累计值，负数 -0.1 或正数 0.1 均按 0.1 处理）
-    stop_loss_timeout     止损时限（在 k = 1..stop_loss_timeout 内检查）
-    values                标签取值 {"take_profit": "B", "stop_loss": "T", "timeout": "N"}
+    price                盈亏计算价格："open"（开盘价）或 "close"（收盘价）
+    take_profit          止盈阈值（百分比，正数，如 10.0 表示 +10%）
+    take_profit_timeout  止盈时限（在 k = 1..take_profit_timeout 内检查）
+    stop_loss            止损阈值（百分比，-8.0 与 8.0 等价，表示 -8%）
+    stop_loss_timeout    止损时限（在 k = 1..stop_loss_timeout 内检查）
+    values               标签取值 {"take_profit": "B", "stop_loss": "T", "timeout": "N"}
 
-逐日判定规则（第 t 天，入场价 = 第 t 日收盘价）：
+逐日判定规则（第 t 天，入场价 P_t = price 列第 t 天值）：
 
-    止盈：在 k = 1..take_profit_timeout 内，
-          profit_k = Σ LU[t+1..t+k]
-          profit_k >= take_profit  -> 止盈（默认 "B"，买入）
-    止损：在 k = 1..stop_loss_timeout 内，
-          profit_k <= -|stop_loss| -> 止损（默认 "T"，卖出）
-    止盈 / 止损各自独立窗口，先触发的一侧生效；同一 k 同时触发时优先止损
-    （保守，标注 values.stop_loss）。
-    两侧窗口内均未触发 -> 无操作（默认 "N"）。
+    profit_k = P_{t+k} / P_t - 1      (k = 1..lookahead)
 
-无效行（未来 max(take_profit_timeout, stop_loss_timeout) 个交易日的 LU 缺失）
-标签为空字符串 ""，由调用方丢弃，避免用不完整的前瞻窗口训练。
+    止盈：k = 1..take_profit_timeout 内任一 profit_k >= take_profit/100
+          -> 止盈（默认 "B"，买入）
+    止损：k = 1..stop_loss_timeout 内任一 profit_k <= -|stop_loss|/100
+          -> 止损（默认 "T"，卖出）
+    其他：两侧窗口内均未触发 -> 无操作（默认 "N"）
+    标签优先级 B > T > N：同一行止盈与止损条件都满足时标注止盈（"B"）。
+
+无效行（入场价缺失/非正，或未来 max(take_profit_timeout, stop_loss_timeout)
+个交易日价格缺失）标签为空字符串 ""，由调用方丢弃，避免用不完整的前瞻
+窗口训练。
 """
 from __future__ import annotations
 
 import numpy as np
+
+# 盈亏计算价格："open"（开盘价）/ "close"（收盘价）
+PRICE_KEYS = ("open", "close")
 
 # 标签取值的三类（values 必须完整覆盖且互不相同）
 VALUE_KEYS = ("take_profit", "stop_loss", "timeout")
@@ -40,25 +41,32 @@ DEFAULT_VALUES = {
     "timeout": "N",
 }
 
-DEFAULT_TAKE_PROFIT = 0.30
-DEFAULT_TAKE_PROFIT_TIMEOUT = 21
-DEFAULT_STOP_LOSS = 0.20
-DEFAULT_STOP_LOSS_TIMEOUT = 15
+DEFAULT_PRICE = "open"
+DEFAULT_TAKE_PROFIT = 10.0          # 百分比：+10%
+DEFAULT_TAKE_PROFIT_TIMEOUT = 15    # 交易日
+DEFAULT_STOP_LOSS = 8.0             # 百分比：-8%
+DEFAULT_STOP_LOSS_TIMEOUT = 10      # 交易日
 
 
 def normalize_label_config(raw: dict | None) -> dict:
     """校验并补全 label 配置，返回规范化 dict。
 
-    缺省值：take_profit=0.30, take_profit_timeout=21, stop_loss=0.20,
-    stop_loss_timeout=15, values={"take_profit":"B","stop_loss":"T","timeout":"N"}。
-    stop_loss 统一取绝对值（配置 -0.1 与 0.1 等价，均表示亏损 0.1 个 LU）。
-    阈值单位均为 LU（涨跌幅利用率）累计值。
+    缺省值：price="open", take_profit=10.0, take_profit_timeout=15,
+    stop_loss=8.0, stop_loss_timeout=10,
+    values={"take_profit":"B","stop_loss":"T","timeout":"N"}。
+    take_profit / stop_loss 均为百分比（10.0 表示 10%）；stop_loss 统一取
+    绝对值（配置 -8.0 与 8.0 等价）。
     """
     raw = dict(raw or {})
 
+    price = str(raw.get("price", DEFAULT_PRICE)).strip().lower()
+    if price not in PRICE_KEYS:
+        raise ValueError(
+            f'label.price 只支持 {" / ".join(PRICE_KEYS)}，当前 {price!r}')
+
     take_profit = float(raw.get("take_profit", DEFAULT_TAKE_PROFIT))
     if not take_profit > 0:
-        raise ValueError(f"label.take_profit 必须为正数，当前 {take_profit}")
+        raise ValueError(f"label.take_profit 必须为正数（百分比），当前 {take_profit}")
 
     take_profit_timeout = int(
         raw.get("take_profit_timeout", DEFAULT_TAKE_PROFIT_TIMEOUT))
@@ -90,6 +98,7 @@ def normalize_label_config(raw: dict | None) -> dict:
         raise ValueError(f"label.values 三类标签取值必须互不相同，当前 {values}")
 
     return {
+        "price": price,
         "take_profit": take_profit,
         "take_profit_timeout": take_profit_timeout,
         "stop_loss": stop_loss,
@@ -100,78 +109,73 @@ def normalize_label_config(raw: dict | None) -> dict:
 
 def label_lookahead(cfg: dict | None = None) -> int:
     """标签向前看的交易日数 = max(止盈时限, 止损时限)。"""
-    cfg = cfg if cfg is not None and "values" in cfg else normalize_label_config(cfg)
+    cfg = normalize_label_config(cfg)
     return max(int(cfg["take_profit_timeout"]), int(cfg["stop_loss_timeout"]))
 
 
-def cumulative_lu(lu, lookahead: int) -> np.ndarray:
-    """返回未来 LU 累计矩阵 F，形状 (lookahead, n)。
+def future_price_matrix(price, lookahead: int) -> np.ndarray:
+    """返回未来价格矩阵 F，形状 (lookahead, n)。
 
-    F[k-1, t] = Σ LU[t+1..t+k]（k = 1..lookahead）；窗口内任一 LU 缺失则为 NaN。
+    F[k-1, t] = P[t+k]（k = 1..lookahead）；窗口越界处保持 NaN。
     """
-    v = np.asarray(lu, dtype=float)
+    v = np.asarray(price, dtype=float)
     n = v.size
     F = np.full((lookahead, n), np.nan, dtype=float)
     if n == 0:
         return F
-
-    nan_flag = np.isnan(v).astype(np.int64)
-    clean = np.where(nan_flag > 0, 0.0, v)
-    # 前缀和：csum[i] = Σ clean[0..i-1]，cnan[i] = 前 i 个中的缺失个数
-    csum = np.concatenate(([0.0], np.cumsum(clean)))
-    cnan = np.concatenate(([0], np.cumsum(nan_flag)))
     for k in range(1, lookahead + 1):
         if n - k <= 0:
             break
-        t = np.arange(n - k)
-        lo = t + 1          # 窗口起点 t+1
-        hi = t + k + 1      # 窗口终点 t+k 的右开边界
-        sums = csum[hi] - csum[lo]
-        bad = (cnan[hi] - cnan[lo]) > 0
-        F[k - 1, : n - k] = np.where(bad, np.nan, sums)
+        F[k - 1, : n - k] = v[k:]
     return F
 
 
-def compute_triple_barrier_labels(lu, cfg: dict | None = None) -> np.ndarray:
-    """计算简单三元屏蔽标签，返回 object 数组（与 lu 等长，无效行为 ""）。
+def compute_triple_barrier_labels(price, cfg: dict | None = None) -> np.ndarray:
+    """计算三元屏蔽标签，返回 object 数组（与 price 等长，无效行为 ""）。
 
-    lu  : 逐日涨跌幅利用率 LU 序列
-    cfg : label 配置（见 normalize_label_config）
+    price : 逐日价格序列（由 label.price 决定取开盘价还是收盘价）
+    cfg   : label 配置（见 normalize_label_config）
 
-    有效行范围：未来 lookahead 个（max(止盈时限, 止损时限)）LU 均有效；
-    其余行（尤其文件末尾 lookahead 行）返回 ""，调用方应丢弃。
+    有效行范围：入场价有效且未来 lookahead 个
+    （max(止盈时限, 止损时限)）交易日价格均有效；其余行（尤其文件末尾
+    lookahead 行）返回 ""，调用方应丢弃。
     """
     cfg = normalize_label_config(cfg)
     tp_days = int(cfg["take_profit_timeout"])
     sl_days = int(cfg["stop_loss_timeout"])
     lookahead = max(tp_days, sl_days)
     values = cfg["values"]
+    tp_threshold = cfg["take_profit"] / 100.0
+    sl_threshold = -cfg["stop_loss"] / 100.0
 
-    v = np.asarray(lu, dtype=float)
+    v = np.asarray(price, dtype=float)
     n = v.size
     labels = np.full(n, "", dtype=object)
     if n <= lookahead:
         return labels
 
-    # 未来 LU 累计矩阵 F[k-1, t] = Σ LU[t+1..t+k]（k = 1..lookahead）
-    F = cumulative_lu(v, lookahead)
+    # 未来价格矩阵 F[k-1, t] = P[t+k]（k = 1..lookahead）
+    F = future_price_matrix(v, lookahead)
     tail = n - lookahead
 
-    # 有效行：未来 lookahead 个 LU 全部有效
-    valid = np.isfinite(F[:, :tail]).all(axis=0)
+    # 有效行：入场价有效且未来 lookahead 个价格全部有效
+    entry = v[:tail]
+    entry_ok = np.isfinite(entry) & (entry > 0)
+    future_ok = np.isfinite(F[:, :tail]).all(axis=0)
+    valid = entry_ok & future_ok
 
-    # 各自独立窗口内的首次触发步（0-based，等于 k-1）；未触发记为对应窗口长度
-    tp_hit = F[:tp_days, :tail] >= cfg["take_profit"]     # NaN 比较为 False
-    sl_hit = F[:sl_days, :tail] <= -cfg["stop_loss"]
-    a = np.where(tp_hit.any(axis=0), tp_hit.argmax(axis=0), tp_days)
-    b = np.where(sl_hit.any(axis=0), sl_hit.argmax(axis=0), sl_days)
+    # 涨跌幅：profit[k-1, t] = P[t+k] / P[t] - 1
+    denom = np.where(entry_ok, entry, 1.0)
+    profit = F[:, :tail] / denom[None, :] - 1.0
 
-    tp_seen = a < tp_days
-    sl_seen = b < sl_days
-    # 同一 k 同时触发时优先止损（保守）：止损在前一交易日及之前才算止盈胜出
-    take = valid & tp_seen & (~sl_seen | (a < b))
-    stop = valid & sl_seen & (~tp_seen | (b <= a))
-    timeout = valid & ~tp_seen & ~sl_seen
+    # 各自窗口内是否触发（NaN 比较恒为 False）
+    tp_hit = (profit[:tp_days] >= tp_threshold).any(axis=0)
+    sl_hit = (profit[:sl_days] <= sl_threshold).any(axis=0)
+
+    # 标签优先级 B > T > N：同一行两类条件都满足时标注止盈
+    take = valid & tp_hit
+    stop = valid & ~tp_hit & sl_hit
+    timeout = valid & ~tp_hit & ~sl_hit
 
     sub = np.full(tail, "", dtype=object)
     sub[timeout] = values["timeout"]

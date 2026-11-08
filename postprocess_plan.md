@@ -7,7 +7,7 @@
 ```
 src/postprocess/
     __init__.py       包入口（导出 postprocess_split / score_samples）
-    config.py         读取 config/classify_train.json 的 postprocess 段
+    config.py         读取独立的 config/postprocess.json（含 enabled 开关）
     postprocess.py    价格过滤 + 指标评估 + 报告输出
 scripts/postprocess.py       启动入口（python3，无需 tsai 环境）
 scripts/tsai/postprocess.sh  快捷入口
@@ -34,7 +34,8 @@ scripts/tsai/postprocess.sh  快捷入口
 - 全类别 accuracy、混淆矩阵、每类 precision / recall / f1 / specificity；
 - macro / weighted 平均；
 - `roc_auc`（ovr, weighted，需要概率列）；
-- 置信度分档（conf >= 0.99 / 0.95 / 0.90 / 0.85 / 0.80 的占比与精度）。
+- 置信度分档：按 `config/classify_train.json` 的 `evaluate.confidence_interval`
+  分档，每档输出 `evaluate.items` 指标，并按 `evaluate.labels` 输出逐标签指标。
 
 报告内容：
 
@@ -49,6 +50,7 @@ scripts/tsai/postprocess.sh  快捷入口
 
 ```json
 {
+  "enabled": true,
   "data_source": "/Users/jucat/data/ashare/preprocessed",
   "validation": "/Users/jucat/data/ashare/validation",
   "models": "/Users/jucat/data/ashare/models",
@@ -59,21 +61,21 @@ scripts/tsai/postprocess.sh  快捷入口
 }
 ```
 
+- `enabled`：后处理开关，`false` 时跳过过滤
 - `data_source`：预处理目录，读 `price_col` / `ma_col`
 - `validation`：推理结果目录（`<模型名>/<split>/results.json`）
 - `models`：模型目录，未传 `--model` 时取其中最新的 `.pkl`
 - `min_conf` 非空时，只统计置信度 >= 该值的信号
 
-## 开关（config/preprocess.json）
+## 开关（config/postprocess.json）
 
-是否启用后处理过滤，由**预处理参数 JSON** 控制（缺省 true）：
+是否启用后处理过滤，由**后处理参数 JSON** 控制（缺省 true）：
 
 ```json
-"postprocess": {
-  "enabled": true
-}
+"enabled": true
 ```
 
+- 训练流水线与 `scripts/postprocess.py` **每次运行都会重新读取该配置**，不使用缓存；
 - `enabled: false`：训练流水线与 `scripts/postprocess.py` 都跳过过滤，
   只保留验证/测试的分类指标评测；
 - 开关只影响是否写过滤报告，**不会修改** `results.json` 或验证 CSV 的
@@ -98,7 +100,7 @@ python3 scripts/postprocess.py
 python3 scripts/postprocess.py --config config/postprocess.json \
     --model models/<模型名>.pkl --split test --min-conf 0.9
 
-# 忽略 config/preprocess.json 的开关，强制执行
+# 忽略 config/postprocess.json 的 enabled 开关，强制执行
 python3 scripts/postprocess.py --force
 
 # 流水线内自动执行（训练 → 验证/测试 → 后处理 → 邮件）

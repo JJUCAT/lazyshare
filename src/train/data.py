@@ -14,8 +14,12 @@
     - train_valid_split()    按 seed 随机划分训练/验证集（旧接口，仅保留兼容）
 
 数据划分的核心约束（防止未来数据泄漏）：
-    1. 切片窗口本身不重叠（见 slice.py：jump_step >= seq_len）；
-    2. 三集合按时间切成连续的三段，训练最早、测试最新，窗口时间区间互不相交；
+    1. 切片窗口允许重叠（见 slice.py：jump_step 可小于 seq_len），样本量约放大
+       seq_len/jump_step 倍；重叠只发生在同一集合内部，跨集合的标签泄漏由第 3
+       条的 purge 间隔控制。代价是相邻窗口的特征区间重叠，因此验证 / 测试
+       指标可能偏乐观，解读时需注意；
+    2. 三集合按窗口末日（决策日）切成连续的三段，训练最早、测试最新；
+       由于窗口跨 seq_len 天，特征区间可能跨集合交叠，真正严格有序的是决策日；
     3. 三元屏蔽标签会向前看 label.max_days 个交易日，因此相邻集合之间再留出
        purge 间隔（train.purge_days，默认 21 个交易日 ≈ 31 个日历日），保证
        训练集标签的前瞻窗口不会跨进验证集、验证集不会跨进测试集。
@@ -148,18 +152,20 @@ def load_config(config_path: Path = DEFAULT_CONFIG) -> dict:
     else:
         seed = int(seed_cfg)
 
-    # evaluate：新格式 {"labels": [...], "items": [...], "accuracy_interval": [...]}；
+    # evaluate：新格式 {"labels": [...], "items": [...], "confidence_interval": [...]}；
     # 旧格式为评分项列表
     evaluate_cfg = cfg.get("evaluate") or {}
     if isinstance(evaluate_cfg, list):
         evaluate_items = [str(x) for x in evaluate_cfg]
         evaluate_labels: list[str] = []
-        accuracy_intervals: list[float] = []
+        confidence_intervals: list[float] = []
     else:
         evaluate_items = [str(x) for x in (evaluate_cfg.get("items") or [])]
         evaluate_labels = [str(x) for x in (evaluate_cfg.get("labels") or [])]
-        # 不同置信度阈值：统计该置信度以上的标签占比与精度
-        accuracy_intervals = [float(x) for x in (evaluate_cfg.get("accuracy_interval") or [])]
+        # 不同置信度阈值：按分档统计 evaluate.items 指标与逐标签指标
+        confidence_intervals = [
+            float(x) for x in (evaluate_cfg.get("confidence_interval") or [])
+        ]
 
     parsed = {
         "data_source": data_source,
@@ -193,7 +199,7 @@ def load_config(config_path: Path = DEFAULT_CONFIG) -> dict:
         "save_best": save_best,
         "evaluate": evaluate_items,
         "evaluate_labels": evaluate_labels,
-        "accuracy_intervals": accuracy_intervals,
+        "confidence_intervals": confidence_intervals,
     }
     return parsed
 
@@ -287,6 +293,11 @@ def collect_samples(dataset_dir: Path, items: list[str], label: str,
         paths.append(csv_path)
         spans.append((start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")))
         n += 1
+        # 逐文件读取在大 dataset（数十万~数百万窗口）下耗时很长，
+        # 每 10 万个样本输出一次进度，便于判断是否卡住
+        if n % 100000 == 0:
+            logging.info("已读取 %d/%d 个窗口样本（%.1f%%）",
+                         n, len(all_paths), 100.0 * n / max(len(all_paths), 1))
 
     if bad_date:
         logging.warning("跳过 %d 个窗口样本：日期无法解析（无法参与时间划分）", bad_date)
@@ -350,7 +361,9 @@ def time_split(spans, ratios=(0.6, 0.2, 0.2), purge_days: int = 21):
         raise ValueError(f"划分比例必须非负且和为 1，当前 {ratios}")
 
     starts, ends = spans[:, 0], spans[:, 1]
-    # 按窗口末日排序 → 时间上连续切三段（窗口本身不重叠，见 slice.py）
+    # 按窗口末日（决策日）排序 → 时间上连续切三段。
+    # 窗口允许重叠（见 slice.py），因此相邻样本的决策日可能只差 jump_step 天，
+    # 跨集合的标签前瞻泄漏靠下面的 purge 间隔裁掉。
     order = np.argsort(ends, kind="stable")
     n_tr = int(round(n * float(ratios[0])))
     n_va = int(round(n * float(ratios[1])))
@@ -390,8 +403,9 @@ def time_split(spans, ratios=(0.6, 0.2, 0.2), purge_days: int = 21):
                 f"time_split: {name_a} 标签前瞻末 {horizon_end} 不早于 "
                 f"{name_b} 最早决策日 {first_b}，时间顺序被破坏（未来数据泄漏）")
         if ends[a].max() >= starts[b].min():
-            logging.debug("time_split: %s 末 %s 与 %s 最早窗口首日 %s 有日历重叠"
-                          "（不同股票、或同一股票不重叠的相邻窗口，属正常横截面）",
+            logging.debug("time_split: %s 决策日 %s 与 %s 最早窗口首日 %s 有特征"
+                          "区间重叠（不同股票、或同一股票 jump_step 重叠的相邻"
+                          "窗口，属正常现象；标签前瞻已由 purge 间隔隔离）",
                           name_a, ends[a].max(), name_b, starts[b].min())
 
     info["train_span"] = span_range(spans, tr)

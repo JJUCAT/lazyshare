@@ -21,6 +21,7 @@
 
 用法：
     python3 src/train/verify.py [--config config/classify_train.json] [--model models/<模型名>.pkl] [-v]
+    python3 src/train/verify.py --report-only    # 复用已有 results.json 重新生成报告
 """
 from __future__ import annotations
 
@@ -370,8 +371,12 @@ def write_split_reports(split: str, samples: list[dict], classes: list[str],
         "== 分类指标 ==",
         *classification_report(y_true, y_pred, classes, probas=probas),
         "",
-        "== 置信度分档（conf = 被预测类别的概率） ==",
-        *(confidence_table(y_true, y_pred, probas, classes)
+        "== 置信度分档指标（conf = 被预测类别的概率；指标同 evaluate.items） ==",
+        *(confidence_table(
+            y_true, y_pred, probas, classes,
+            intervals=cfg.get("confidence_intervals") or None,
+            metrics=cfg.get("evaluate") or None,
+            labels=cfg.get("evaluate_labels") or None)
           if probas else ["缺少概率矩阵，跳过置信度分档"]),
     ]
 
@@ -391,6 +396,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="模型 pkl 路径（默认取 models 目录最新 <label>_<arch>-*.pkl）")
     parser.add_argument("--split", choices=("valid", "test", "all"), default="all",
                         help="要评估的数据集：valid=验证集，test=测试集，all=两者（默认）")
+    parser.add_argument("--report-only", action="store_true",
+                        help="复用已有 results.json 重新生成报告（不重新推理）")
     parser.add_argument("-v", "--verbose", action="store_true", help="输出调试日志")
     args = parser.parse_args(argv)
 
@@ -415,9 +422,37 @@ def main(argv: list[str] | None = None) -> int:
     logging.info("类别顺序 %s，batch_tfms: %s，划分比例: %s",
                  classes, batch_tfms, m.get("split_ratio"))
 
+    targets = ["valid", "test"] if args.split == "all" else [args.split]
+
+    # --report-only：复用已有 results.json 重新生成报告（不加载模型、不重新推理）
+    if args.report_only:
+        total = 0
+        for split in targets:
+            results_path = cfg["validation"] / m["model"] / split / RESULTS_FILE
+            if not results_path.exists():
+                logging.warning("[%s] results.json 不存在，跳过: %s",
+                                split, results_path)
+                continue
+            with open(results_path, "r", encoding="utf-8") as f:
+                results = json.load(f)
+            samples = results.get("samples") or []
+            res_classes = results.get("classes") or classes
+            if not samples:
+                logging.warning("[%s] results.json 无样本，跳过", split)
+                continue
+            reports = write_split_reports(split, samples, res_classes, m, cfg)
+            for p in reports:
+                logging.info("[%s] 报告已重新生成: %s", split, p)
+            total += len(samples)
+        if total == 0:
+            logging.error("没有任何 results.json 可用于重新生成报告")
+            return 1
+        logging.info("(--report-only) 完成：复用 %d 个已有推理样本，报告位于 %s",
+                     total, cfg["models"])
+        return 0
+
     learn = load_learner(model_path)
 
-    targets = ["valid", "test"] if args.split == "all" else [args.split]
     total_ok = 0
     for split in targets:
         window_paths = split_window_paths(m, split)

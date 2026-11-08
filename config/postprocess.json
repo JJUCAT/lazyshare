@@ -1,4 +1,6 @@
 {
+  "enabled": true,
+
   "data_source": "/Users/jucat/data/ashare/preprocessed",
   "validation": "/Users/jucat/data/ashare/validation",
   "models": "/Users/jucat/data/ashare/models",

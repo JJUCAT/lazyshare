@@ -5,9 +5,8 @@ preprocess 实现：
   "raw_data"：原始数据路径
   "preprocessed_data"：预处理数据路径
   "weather"：行业成交量，大盘成交量
-  "postprocess"：{"enabled": true/false}，是否启用后处理对模型推理结果的过滤
-                 （关闭时只做验证/测试指标评测，见 postprocess_plan.md）
   "label"：三元屏蔽（止盈 / 止损 / 时限）参数，见下文“label 配置参数说明”
+（后处理开关已迁移到 config/postprocess.json 的 "enabled"，见 postprocess_plan.md）
 4.scripts/preprocess.py：启动预处理
 
 使用一半 cpu 核心数量多线程加速处理
@@ -40,9 +39,10 @@ st，*st，退市股票跳过，不生成预处理数据文件
 峰值标签：使用简化的三元屏蔽法（triple barrier），止盈标注 B（买入），止损标注 T（卖出），其他标注无操作 N
 preprocess.json 参数说明
 "label": {
-  "take_profit" // 盈利：LU 累计值阈值
+  “price” // 盈亏计算价格
+  "take_profit" // 盈利百分比，单位%
   "take_profit_timeout" // 盈利时限
-  "stop_loss" // 亏损：LU 累计值阈值（正负号等价）
+  "stop_loss" // 亏损百分比，单位%
   "stop_loss_timeout" // 亏损时限
   "values": {
     "take_profit": // 止盈标注
@@ -52,18 +52,7 @@ preprocess.json 参数说明
 }
 
 三元屏蔽标注实现（src/preprocess/label/triple_barrier.py）
-盈亏用涨跌幅利用率 LU 累加衡量（不用价格收益率，天然消除板块涨跌幅限制差异）：
-  对第 t 个交易日（入场 = 第 t 日收盘价），
-  1.profit_k = Σ LU[t+1..t+k]（k = 1..对应时限）
-  2.止盈：在 k = 1..take_profit_timeout（止盈时限，默认 21 日）内，
-       profit_k >= take_profit → 止盈，标注 values.take_profit（B，买入）
-  3.止损：在 k = 1..stop_loss_timeout（止损时限，默认 15 日）内，
-       profit_k <= -|stop_loss| → 止损，标注 values.stop_loss（T，卖出）
-     （stop_loss 配置写 -0.2 或 0.2 等价，均表示亏损 0.2 个 LU）
-  4.止盈 / 止损各自独立窗口，先触发的一侧生效；同一 k 同时触发时优先止损（保守）
-  5.其他标注为 N
-  6.末尾 max(take_profit_timeout, stop_loss_timeout) 个交易日的前瞻窗口不完整，
-    标签为空并丢弃；--update 比对时也不计入这些日期
+用 price(open | close) 计算盈亏，如果使用 close，profit = (C_{k+t}-C_{k})/C_{k}。如果使用 open，profit = (O_{k+t}-O_{k})/O_{k}。如果在盈利时限内能达到盈利，第 k 条时序标注为 B。如果在止损时限内达到亏损值，第 k 条时序标注为 T。其他情况标注为 N。标签优先级 B > T > N。
 标签参数写入 preprocessed_data/.label_signature.json；参数变化时自动清理旧
 预处理文件后重新生成（--update 也生效）
 

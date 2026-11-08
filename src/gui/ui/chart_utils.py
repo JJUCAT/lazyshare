@@ -8,6 +8,10 @@ import numpy as np
 
 AXIS_TICKS = 5  # 纵轴刻度数量
 
+# 取值有明确固定边界的列项：纵轴直接使用该范围，不做 5% 边距放大。
+# 目前无固定边界指标（W21LNV 新公式不再保证 [-1, 1]），保留扩展位。
+FIXED_RANGES: dict[str, tuple[float, float]] = {}
+
 
 def is_missing(value) -> bool:
     """判断是否为缺失值（None / NaN）。"""
@@ -62,7 +66,11 @@ def format_tick(value: float, step: float) -> str:
 
 
 def series_range(series_list, offset: int, show: int) -> tuple[float | None, float | None]:
-    """计算若干序列在可见窗口内的数据范围（带 5% 边距），无有效值返回 (None, None)。"""
+    """计算若干序列在可见窗口内的数据范围，无有效值返回 (None, None)。
+
+    默认在数据范围上留 5% 边距；若序列属于 FIXED_RANGES（如 W21LNV 的
+    [-1, 1]），则纵轴覆盖该固定区间且不再放大边距。
+    """
     vmin = None
     vmax = None
     for s in series_list:
@@ -79,6 +87,18 @@ def series_range(series_list, offset: int, show: int) -> tuple[float | None, flo
         vmax = hi if vmax is None else max(vmax, hi)
     if vmin is None or vmax is None:
         return None, None
+    # 固定范围列项：轴范围至少覆盖配置区间，且不做边距放大
+    fixed = False
+    for s in series_list:
+        bounds = FIXED_RANGES.get(getattr(s, "column", ""))
+        if bounds is None:
+            continue
+        lo, hi = bounds
+        vmin = min(vmin, lo)
+        vmax = max(vmax, hi)
+        fixed = True
+    if fixed:
+        return vmin, vmax
     if vmin == vmax:
         pad = abs(vmin) * 0.05 or 1.0
         vmin -= pad

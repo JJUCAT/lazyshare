@@ -35,9 +35,7 @@ import pandas as pd  # noqa: E402
 
 from src.postprocess.config import (  # noqa: E402
     DEFAULT_CONFIG,
-    PREPROCESS_CONFIG,
     load_postprocess_config,
-    postprocess_enabled,
 )
 from src.train.report import (  # noqa: E402
     classification_report,
@@ -138,8 +136,9 @@ def _label_stats(samples: list[dict], label: str) -> dict:
             "precision": prec, "recall": rec, "f1": f1}
 
 
-def _subset_report(samples: list[dict], classes: list[str], heading: str) -> list[str]:
-    """在完整类别空间上输出分类指标 + 置信度分档。"""
+def _subset_report(samples: list[dict], classes: list[str], heading: str,
+                   labels: list[str] | None = None) -> list[str]:
+    """在完整类别空间上输出分类指标 + 置信度分档指标。"""
     lines = ["", f"== {heading} =="]
     if not samples:
         lines.append("无样本")
@@ -150,8 +149,8 @@ def _subset_report(samples: list[dict], classes: list[str], heading: str) -> lis
     probas = [s["probas"] for s in samples] if has_probas else None
     lines += classification_report(y_true, y_pred, classes, probas=probas)
     lines.append("")
-    lines.append("-- 置信度分档 --")
-    lines += (confidence_table(y_true, y_pred, probas, classes)
+    lines.append("-- 置信度分档指标（conf = 被预测类别的概率） --")
+    lines += (confidence_table(y_true, y_pred, probas, classes, labels=labels)
               if probas else ["缺少概率矩阵，跳过置信度分档"])
     return lines
 
@@ -182,7 +181,8 @@ def score_samples(samples: list[dict], classes: list[str], cfg: dict,
     split_name = SPLIT_NAMES.get(split, split)
     lines = _subset_report(
         samples, classes,
-        f"价格过滤后指标（{split_name}，{'/'.join([buy, sell])} 信号）")
+        f"价格过滤后指标（{split_name}，{'/'.join([buy, sell])} 信号）",
+        labels=[buy, sell])
     lines += ["", "== 过滤后逐标签对比 =="]
     lines.append(f"{'类别':<6}{'support':>9}{'预测数':>9}{'precision':>11}"
                  f"{'recall':>9}{'f1':>9}")
@@ -344,11 +344,8 @@ def main(argv: list[str] | None = None) -> int:
         description="后处理：按 M5C 过滤 B/T 信号并重新评估精度/召回/F1")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG,
                         help="后处理配置文件路径（默认: config/postprocess.json）")
-    parser.add_argument("--preprocess-config", type=Path, default=PREPROCESS_CONFIG,
-                        help="预处理配置（读取 postprocess.enabled 开关，"
-                             "默认: config/preprocess.json）")
     parser.add_argument("--force", action="store_true",
-                        help="忽略预处理配置中的 postprocess.enabled 开关，强制执行")
+                        help="忽略配置文件中的 enabled 开关，强制执行")
     parser.add_argument("--model", default=None,
                         help="模型 pkl 路径或模型名（默认取 models 目录最新）")
     parser.add_argument("--split", choices=("valid", "test", "all"), default="all",
@@ -366,14 +363,13 @@ def main(argv: list[str] | None = None) -> int:
         datefmt="%H:%M:%S",
     )
 
-    # 开关：config/preprocess.json 的 postprocess.enabled（缺省 true）。
+    # 开关：每次运行实时读取 config/postprocess.json 的 enabled（缺省 true）。
     # 关闭时直接跳过，不修改推理结果与验证/测试指标。
-    if not args.force and not postprocess_enabled(args.preprocess_config):
-        logging.info("后处理已关闭（%s 的 postprocess.enabled=false），跳过；"
-                     "推理结果与验证/测试分类指标不受影响", args.preprocess_config)
-        return 0
-
     cfg = load_postprocess_config(args.config)
+    if not args.force and not cfg["enabled"]:
+        logging.info("后处理已关闭（%s 的 enabled=false），跳过；"
+                     "推理结果与验证/测试分类指标不受影响", args.config)
+        return 0
     if args.min_conf is not None:
         if not 0.0 <= args.min_conf <= 1.0:
             raise SystemExit(f"--min-conf 必须在 [0, 1] 之间，当前 {args.min_conf}")

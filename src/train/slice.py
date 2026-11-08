@@ -16,13 +16,17 @@
     3. 切片保存为 CSV，必须保留"日期"列；文件名 = 源文件名-开始日期-结束日期.csv。
     4. 同一个数据源（源 CSV）的切片保存在 dataset 路径下的同名文件夹中：
        输出路径 = dataset/<源文件名>/<源文件名>-开始日期-结束日期.csv。
-    5. 窗口不允许重叠：要求 jump_step >= seq_len，且 throw_last_one 必须为 true。
-       原因：train/verify 按窗口随机划分训练集与验证集，重叠窗口会让同一段行情
-       同时出现在训练集和验证集（数据泄漏），验证指标失去意义。
-       - jump_step == seq_len：无缝平铺，窗口间零重叠；
-       - jump_step > seq_len：窗口间留有空隙，同样不重叠；
-       - throw_last_one=false 会补一个以文件最后一天收尾的窗口（起点
-         len-seq_len），它与前面的平铺窗口尾部重叠，故被禁止。
+    5. 窗口允许重叠：jump_step 可以小于 seq_len（如 seq_len=42、jump_step=5，
+       相邻窗口共享 37 行），样本量约放大 seq_len/jump_step 倍。
+       - 每个窗口仍只在"末位"贡献一个训练标签（见 src/train/data.py 的
+         window_last_label），窗口内其余行的标签只随 CSV 保存、不参与 loss；
+       - 训练 / 验证 / 测试按窗口末日（决策日）的时间顺序切分（见
+         src/train/data.py 的 time_split），跨集合的标签前瞻泄漏由
+         train.purge_days 控制；
+       - 代价：相邻窗口特征区间重叠，验证 / 测试指标可能偏乐观。
+       - throw_last_one=true：只切到最后一个完整窗口（不留尾巴）；
+         throw_last_one=false：额外补一个以文件最后一天收尾的对齐窗口，
+         让最新的决策日也能进入训练集。
     6. 后处理专用列（M5C / M60C）不参与切片：它们只在 postprocess 阶段用于
        "收盘价 vs 均线"的买卖信号过滤，作为特征会改变模型输入口径，故配置
        slice.items 中不允许出现，见 POSTPROCESS_ONLY_COLS。
@@ -110,19 +114,22 @@ def load_train_config(config_path: Path) -> dict:
         items = [DATE_COL] + items  # 保证日期列参与输出，但不作为数值特征
     if seq_len <= 0 or jump_step <= 0:
         raise ValueError("slice.seq_len / slice.jump_step 必须为正整数")
-    # 窗口必须不重叠：jump_step >= seq_len。否则同一只股票相邻窗口共享大部分数据
-    # （如 seq_len=42、jump_step=7 时重叠 35/42），而 train/verify 是按窗口随机
-    # 划分训练集与验证集的，重叠窗口会跨集泄漏，使验证指标虚高。
+    # 允许重叠切片：jump_step < seq_len 时相邻窗口共享 seq_len-jump_step 行数据，
+    # 每个窗口仍只在"末位"贡献一个标签（window_last_label），因此样本量约放大
+    # seq_len/jump_step 倍。跨集合的标签前瞻泄漏由 train.purge_days 控制：
+    # time_split 只丢弃"标签前瞻会越过下一集合最早决策日"的样本。
+    # 代价：相邻窗口特征区间重叠，验证 / 测试指标可能偏乐观。
     if jump_step < seq_len:
-        raise ValueError(
-            f"slice.jump_step({jump_step}) 必须 >= slice.seq_len({seq_len})："
-            f"窗口不允许重叠，否则训练集与验证集共享同一段行情数据（数据泄漏）")
-    # throw_last_one=False 会额外补一个"以文件最后一天收尾"的窗口，其起点为
-    # len-seq_len，与前面的平铺窗口尾部重叠，同样破坏"窗口不重叠"约束。
+        logging.warning(
+            "切片重叠：jump_step(%d) < seq_len(%d)，相邻窗口共享 %d 行，"
+            "样本量约 ×%.1f；跨集合标签泄漏由 purge_days 控制，"
+            "但特征区间重叠会使验证指标偏乐观",
+            jump_step, seq_len, seq_len - jump_step, seq_len / float(jump_step))
+    # throw_last_one=false：额外补一个"以文件最后一天收尾"的窗口（起点
+    # len-seq_len），让全样本最新的决策日也进入训练集；该窗口与相邻平铺窗口的
+    # 重叠行数不超过 jump_step，与上面的重叠语义一致，不再视为非法。
     if not throw_last_one:
-        raise ValueError(
-            "slice.throw_last_one 必须为 true：补生成的末尾对齐窗口会与前面的"
-            "平铺窗口重叠，破坏训练/验证集不重叠的约束")
+        logging.info("throw_last_one=false：将补一个以文件最后一天收尾的对齐窗口")
 
     return {
         "data_source": data_source,
@@ -313,6 +320,7 @@ def slice_file(task: tuple[Path, dict]) -> dict:
 
     n_windows = 0
     removed_single = 0
+    removed_nan = 0
     removed_income = 0
     aligned_windows = 0
 
@@ -321,9 +329,11 @@ def slice_file(task: tuple[Path, dict]) -> dict:
 
         删除规则：
             - 整个窗口都是同一个标签（无分类信息）；
+            - 窗口内特征列存在 NaN（如 W21LNV 居中窗口在数据尾部为 NaN）；
             - 启用收益滤波且窗口内无任意一个 B→T 组合满足涨幅条件。
         """
-        nonlocal n_windows, removed_single, removed_income, aligned_windows
+        nonlocal n_windows, removed_single, removed_nan, removed_income
+        nonlocal aligned_windows
         full_win = df.iloc[s:s + seq_len]
         # 切片后检查：整个窗口都是同一个标签（无分类信息）则删除，不生成
         if label:
@@ -331,6 +341,11 @@ def slice_file(task: tuple[Path, dict]) -> dict:
             if win_labels.nunique() <= 1:
                 removed_single += 1
                 return
+        # 特征列必须全部有效：居中窗口类指标（W21LNV）在源数据尾部为 NaN，
+        # 含 NaN 的窗口不能作为训练样本
+        if not full_win[feat_cols].notna().all().all():
+            removed_nan += 1
+            return
         # 收益滤波器：窗口内没有满足条件的 B→T 则删除该窗口样本
         if inc_time > 0 and CLOSE_COL in full_win.columns:
             if not window_passes_income_filter(
@@ -360,6 +375,7 @@ def slice_file(task: tuple[Path, dict]) -> dict:
 
     return {"status": "ok", "file": raw_file.name,
             "windows": n_windows, "removed_single": removed_single,
+            "removed_nan": removed_nan,
             "removed_income": removed_income,
             "aligned": aligned_windows}
 
@@ -427,6 +443,7 @@ def main(argv: list[str] | None = None) -> int:
     skipped = 0
     total_windows = 0
     removed_single = 0
+    removed_nan = 0
     removed_income = 0
     total_aligned = 0
     with ProcessPoolExecutor(max_workers=n_workers) as executor:
@@ -438,6 +455,7 @@ def main(argv: list[str] | None = None) -> int:
             processed += 1
             total_windows += result.get("windows", 0)
             removed_single += result.get("removed_single", 0)
+            removed_nan += result.get("removed_nan", 0)
             removed_income += result.get("removed_income", 0)
             total_aligned += result.get("aligned", 0)
             if processed % 200 == 0:
@@ -445,9 +463,9 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.info("完成：切片文件 %d 个，跳过 %d 个，生成窗口样本 %d 个"
                  "（含末尾对齐窗口 %d 个；删除单标签窗口 %d 个；"
-                 "收益滤波删除 %d 个）",
+                 "含 NaN 特征窗口 %d 个；收益滤波删除 %d 个）",
                  processed, skipped, total_windows, total_aligned,
-                 removed_single, removed_income)
+                 removed_single, removed_nan, removed_income)
 
     # 记录切片格式签名，供下次运行校验 dataset 与 config 是否匹配
     write_dataset_signature(dataset_dir, dataset_signature(cfg))

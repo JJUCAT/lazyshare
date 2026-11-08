@@ -17,8 +17,11 @@ from __future__ import annotations
 
 import numpy as np
 
-# 置信度分档默认阈值（与 config.evaluate.accuracy_interval 保持一致）
-DEFAULT_INTERVALS = (0.99, 0.95, 0.90, 0.85, 0.80)
+# 置信度分档默认阈值（与 config.evaluate.confidence_interval 保持一致）
+DEFAULT_INTERVALS = (0.90, 0.80, 0.65, 0.50)
+
+# 置信度分档默认指标（与 config.evaluate.items 支持的评分项一致）
+DEFAULT_METRICS = ("accuracy", "precision", "recall", "f1_score", "roc_auc")
 
 
 def _pct(a: int, b: int) -> str:
@@ -202,30 +205,133 @@ def classification_report(y_true, y_pred, classes: list[str],
     return lines
 
 
-def confidence_table(y_true, y_pred, probas, classes: list[str],
-                     intervals=DEFAULT_INTERVALS) -> list[str]:
-    """置信度分档统计：conf >= 阈值的样本占比，以及该子集的精度。
+def _metric_values(y_true, y_pred, probas, classes: list[str],
+                   metrics) -> dict[str, float | None]:
+    """在给定子集上计算 evaluate.items 指标，单指标失败时返回 None。
 
-    conf 取"被预测类别的概率"（未做任何加权），与实际决策口径一致。
+    缺少 scikit-learn 时所有指标降级为 None（报告显示 "-"），不中断报告生成。
     """
-    if not len(y_true):
-        return ["无样本"]
+    out: dict[str, float | None] = {str(m): None for m in metrics}
+    try:
+        from sklearn.metrics import (
+            accuracy_score,
+            f1_score,
+            precision_score,
+            recall_score,
+            roc_auc_score,
+        )
+        from sklearn.preprocessing import label_binarize
+    except Exception:  # noqa: BLE001
+        return out
+
     idx = {c: i for i, c in enumerate(classes)}
-    confs = []
-    for t, p, row in zip(y_true, y_pred, probas):
-        i = idx.get(p)
-        confs.append(float(row[i]) if (i is not None and i < len(row)) else float("nan"))
-    confs = np.asarray(confs, dtype=float)
-    correct = np.asarray([t == p for t, p in zip(y_true, y_pred)])
+    yt = np.asarray([idx.get(t, -1) for t in y_true], dtype=int)
+    yp = np.asarray([idx.get(p, -1) for p in y_pred], dtype=int)
+    for raw in metrics:
+        key = str(raw).strip().lower()
+        try:
+            if key == "accuracy":
+                val = float(accuracy_score(yt, yp))
+            elif key == "precision":
+                val = float(precision_score(yt, yp, average="weighted",
+                                            zero_division=0))
+            elif key == "recall":
+                val = float(recall_score(yt, yp, average="weighted",
+                                         zero_division=0))
+            elif key == "f1_score":
+                val = float(f1_score(yt, yp, average="weighted", zero_division=0))
+            elif key == "roc_auc":
+                if probas is None or len(yt) < 2:
+                    raise ValueError("缺少概率或样本不足")
+                if len(set(yt.tolist())) < 2:
+                    raise ValueError("子集真实类别不足 2 类")
+                prob = np.asarray(probas, dtype=float)
+                if len(classes) == 2:
+                    val = float(roc_auc_score((yt == 1).astype(int), prob[:, 1]))
+                else:
+                    y_bin = label_binarize(yt, classes=list(range(len(classes))))
+                    val = float(roc_auc_score(y_bin, prob, multi_class="ovr",
+                                              average="weighted"))
+            else:
+                out[raw] = None
+                continue
+        except Exception:  # noqa: BLE001
+            val = None
+        out[raw] = val if (val is not None and np.isfinite(val)) else None
+    return out
+
+
+def _label_metrics(y_true, y_pred, label: str) -> tuple[int, int, float, float, float]:
+    """单标签在子集内的 support / 预测数 / precision / recall / f1。"""
+    support = sum(1 for t in y_true if t == label)
+    pred_n = sum(1 for p in y_pred if p == label)
+    tp = sum(1 for t, p in zip(y_true, y_pred) if t == label and p == label)
+    prec = tp / pred_n if pred_n else 0.0
+    rec = tp / support if support else 0.0
+    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
+    return support, pred_n, prec, rec, f1
+
+
+def confidence_table(y_true, y_pred, probas, classes: list[str],
+                     intervals=DEFAULT_INTERVALS,
+                     metrics=None,
+                     labels: list[str] | None = None,
+                     confs=None) -> list[str]:
+    """置信度分档：每个阈值输出 evaluate.items 指标与逐标签指标。
+
+    conf 取"被预测类别的概率"（未加权，与实际决策口径一致）；也可通过
+    confs 显式传入（如 results.json 的 conf 字段）。
+    metrics 为空时使用 DEFAULT_METRICS；labels 为空时不输出逐标签明细。
+    """
+    y_true = list(y_true)
+    y_pred = list(y_pred)
+    n = len(y_true)
+    if not n:
+        return ["无样本"]
+    metrics = [str(m) for m in (metrics or DEFAULT_METRICS)]
+
+    if confs is None:
+        idx = {c: i for i, c in enumerate(classes)}
+        prob_arr = np.asarray(probas, dtype=float) if probas is not None else None
+        confs = []
+        for k, p in enumerate(y_pred):
+            i = idx.get(p)
+            if (prob_arr is not None and i is not None
+                    and i < prob_arr.shape[1]):
+                confs.append(float(prob_arr[k, i]))
+            else:
+                confs.append(float("nan"))
+    confs = np.asarray([np.nan if c is None else float(c) for c in confs],
+                       dtype=float)
+    prob_arr = np.asarray(probas, dtype=float) if probas is not None else None
 
     lines = [f"置信度: 均值 {np.nanmean(confs):.4f}  中位数 {np.nanmedian(confs):.4f}"
              f"  最低 {np.nanmin(confs):.4f}",
-             f"{'阈值':<8}{'命中数':>8}{'占比':>10}{'精度':>10}"]
+             f"{'阈值':<8}{'样本数':>9}{'占比':>9}"
+             + "".join(f"{m:>12}" for m in metrics)]
     for thr in intervals:
+        thr = float(thr)
         mask = np.isfinite(confs) & (confs >= thr)
         n_hit = int(mask.sum())
-        acc = float(correct[mask].mean()) if n_hit else 0.0
-        lines.append(f"{thr:<8}{n_hit:>8}{_pct(n_hit, len(confs)):>10}{acc:>10.4f}")
+        if n_hit:
+            sel = np.flatnonzero(mask)
+            yt = [y_true[i] for i in sel]
+            yp = [y_pred[i] for i in sel]
+            pb = prob_arr[mask] if prob_arr is not None else None
+            vals = _metric_values(yt, yp, pb, classes, metrics)
+        else:
+            yt, yp = [], []
+            vals = {m: None for m in metrics}
+        row = f"{thr:<8.2f}{n_hit:>9}{_pct(n_hit, n):>9}"
+        for m in metrics:
+            v = vals.get(m)
+            row += f"{'-' if v is None else f'{v:.4f}':>12}"
+        lines.append(row)
+        if labels and yt:
+            for lab in labels:
+                support, pred_n, prec, rec, f1 = _label_metrics(yt, yp, lab)
+                lines.append(f"    {lab}  support={support}  预测={pred_n}  "
+                             f"precision={prec:.4f}  recall={rec:.4f}  f1={f1:.4f}")
     return lines
 
 

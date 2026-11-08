@@ -136,12 +136,15 @@ def process_file(task: tuple[Path, Path]) -> dict:
     # IMV：行业成交量 / 大盘成交量；SIV：个股成交量 / 行业成交量（基于 weather.csv）
     imv, siv = compute_imv_siv(df, _WEATHER if _WEATHER is not None else EMPTY_WEATHER)
 
-    # 简单三元屏蔽标签：止盈（默认 B）/ 止损（默认 T）/ 其他（默认 N）
-    # 盈亏用 LU（涨跌幅利用率）累加衡量：profit_k = Σ LU[t+1..t+k]；
-    # 止盈只在 k = 1..take_profit_timeout 内检查，止损只在 k = 1..stop_loss_timeout
-    # 内检查（各自独立窗口）
+    # 三元屏蔽标签：止盈（默认 B）/ 止损（默认 T）/ 其他（默认 N）。
+    # 盈亏按 label.price 指定的价格计算：
+    #     profit_k = P[t+k] / P[t] - 1
+    # 止盈在 k = 1..take_profit_timeout 内检查，止损在 k = 1..stop_loss_timeout
+    # 内检查（各自独立窗口），标签优先级 B > T > N。
+    price_key = label_cfg.get("price", "open")
+    price = ind["open"] if price_key == "open" else ind["close"]
     labels = compute_triple_barrier_labels(
-        ind["lu"].to_numpy(dtype=float),
+        price.to_numpy(dtype=float),
         label_cfg,
     )
 
@@ -164,6 +167,8 @@ def process_file(task: tuple[Path, Path]) -> dict:
             "M21V": ind["m21v"],
             "ATR": ind["atr"],
             "TR": ind["tr"],
+            "LNV": ind["lnv"],
+            "W21LNV": ind["w21lnv"],
             "IMV": imv,
             "SIV": siv,
             "峰值标签": labels,
@@ -352,11 +357,15 @@ def main(argv: list[str] | None = None) -> int:
     logging.info("并行 worker 数量: %d（CPU 核心数: %s）",
                  n_workers, os.cpu_count())
     logging.info(
-        "简单三元屏蔽标签（盈亏=Σ LU）: 止盈 LU>=%.2f / 前 %d 日→%s, "
-        "止损 LU<=-%.2f / 前 %d 日→%s, 其他→%s（同一日双触发优先止损）",
+        "三元屏蔽标签（价格=%s）: 止盈 >=+%.2f%% / 前 %d 日→%s, "
+        "止损 <=-%.2f%% / 前 %d 日→%s, 其他→%s（优先级 %s > %s > %s）",
+        "开盘价" if label_cfg["price"] == "open" else "收盘价",
         label_cfg["take_profit"], label_cfg["take_profit_timeout"],
         label_cfg["values"]["take_profit"],
         label_cfg["stop_loss"], label_cfg["stop_loss_timeout"],
+        label_cfg["values"]["stop_loss"],
+        label_cfg["values"]["timeout"],
+        label_cfg["values"]["take_profit"],
         label_cfg["values"]["stop_loss"],
         label_cfg["values"]["timeout"],
     )

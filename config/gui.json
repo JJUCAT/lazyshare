@@ -29,32 +29,12 @@
       {
         "series": [
           {
-            "column": "ATR",
+            "column": "LNV",
             "side": "left"
           },
           {
-            "column": "TR",
+            "column": "W21LNV",
             "side": "right"
-          }
-        ]
-      },
-      {
-        "series": [
-          {
-            "column": "LU",
-            "side": "left"
-          },
-          {
-            "column": "OLU",
-            "side": "left"
-          },
-          {
-            "column": "HLU",
-            "side": "left"
-          },
-          {
-            "column": "LLU",
-            "side": "left"
           }
         ]
       }

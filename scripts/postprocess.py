@@ -6,14 +6,13 @@
     - src/postprocess/config.py      ：读取独立的 config/postprocess.json
     - src/postprocess/postprocess.py ：价格过滤 + 精度/召回/F1 评估 + 报告输出
 
-开关（config/preprocess.json）：
-    "postprocess": { "enabled": true }
-关闭时本脚本直接跳过，不改动推理结果 results.json 与验证/测试分类指标；
-需要临时强制执行可加 --force。
+开关（config/postprocess.json）：
+    "enabled": true
+每次运行都会实时读取该配置；关闭时本脚本直接跳过，不改动推理结果
+results.json 与验证/测试分类指标；需要临时强制执行可加 --force。
 
 用法：
-    python3 scripts/postprocess.py [--config config/postprocess.json]
-        [--preprocess-config config/preprocess.json] [--force]
+    python3 scripts/postprocess.py [--config config/postprocess.json] [--force]
         [--model models/<模型名>.pkl] [--split valid|test|all] [--min-conf 0.9] [-o out.log]
 
 输出：
