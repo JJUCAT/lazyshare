@@ -2,7 +2,7 @@
 # 快捷运行数据切片：把预处理 CSV 按固定窗口切成 tsai 训练样本文件
 #
 # 用法:
-#   bash scripts/tsai/slice.sh [--config CONFIG] [--limit N] [--workers N] [-v]
+#   bash scripts/tsai/slice.sh [--config CONFIG] [--limit N] [--workers N] [--update] [-v]
 #
 # 说明:
 #   - 读取 config/classify_train.json（默认），或通过 --config 指定

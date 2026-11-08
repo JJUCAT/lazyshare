@@ -193,13 +193,13 @@ def needs_update(raw_file: Path, out_dir: Path, lookahead: int = 0) -> bool:
 
     - ST 股票不生成输出，无需更新
     - 输出文件不存在 → 需要（新股票）
-    - 输出文件缺少原始数据中的任意日期 → 需要
-    - 输出文件已包含原始数据全部日期 → 无需
+    - 输出文件缺少原始数据中的任意应输出日期 → 需要
+    - 输出文件已包含原始数据全部应输出日期 → 无需
 
-    lookahead：三元屏蔽标签向前看的交易日数
-    （max(take_profit_timeout, stop_loss_timeout)）。原始数据末尾 lookahead
-    个交易日的前瞻窗口不完整，预处理会丢弃这些行，因此比对时不计入
-    （否则永远判定"需要更新"）。
+    比对时排除两类预处理本就会丢弃的行：
+        - 开头 IPO_SKIP_DAYS 个交易日（涨跌幅无限制）；
+        - 末尾 lookahead 个交易日（三元屏蔽标签前瞻窗口不完整）。
+    否则每个文件都会因开头几天缺失而被永远判定"需要更新"。
     """
     raw_dates: list[str] = []
     code = name = ""
@@ -262,8 +262,9 @@ def needs_update(raw_file: Path, out_dir: Path, lookahead: int = 0) -> bool:
                     out_dates.add(row[di])
     except OSError:
         return True
-    # 末尾 lookahead 天的前瞻窗口不完整，预处理本就会丢弃，不参与比对
-    expected = raw_dates[: len(raw_dates) - lookahead] if lookahead > 0 else raw_dates
+    # 开头 IPO_SKIP_DAYS 天与末尾 lookahead 天预处理本就会丢弃，不参与比对
+    end = len(raw_dates) - lookahead if lookahead > 0 else len(raw_dates)
+    expected = raw_dates[IPO_SKIP_DAYS:end]
     return not set(expected).issubset(out_dates)
 
 

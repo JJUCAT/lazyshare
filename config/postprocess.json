@@ -1,5 +1,5 @@
 {
-  "enabled": true,
+  "enabled": false,
 
   "data_source": "/Users/jucat/data/ashare/preprocessed",
   "validation": "/Users/jucat/data/ashare/validation",

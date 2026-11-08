@@ -40,7 +40,9 @@
        因此 config/classify_train.json 默认不再配置 income_filter（不启用）。
 
 用法：
-    python3 scripts/tsai/slice.py [--config config/classify_train.json] [--limit N] [--workers N]
+    python3 scripts/tsai/slice.py [--config config/classify_train.json]
+        [--limit N] [--workers N] [--update]
+    --update：增量切片，仅重建源预处理文件比现有窗口更新的股票
 """
 from __future__ import annotations
 
@@ -380,6 +382,26 @@ def slice_file(task: tuple[Path, dict]) -> dict:
             "aligned": aligned_windows}
 
 
+def needs_reslice(src_file: Path, dataset_dir: Path) -> bool:
+    """判断源预处理 CSV 是否需要重新切片（增量模式）。
+
+    - 对应 dataset 子目录不存在 → 需要；
+    - 源 CSV 修改时间晚于子目录 mtime → 需要；
+    - 否则无需重建，旧窗口保持原样。
+
+    切片重建该股票时，主流程会先删除旧窗口再写入新窗口，目录 mtime 随之更新；
+    即使切不出任何窗口（新股数据太短），目录也已创建，同样视为已处理。
+    只 stat 每个股票的目录，避免遍历数百万个窗口文件。
+    """
+    sub = dataset_dir / src_file.stem
+    if not sub.is_dir():
+        return True
+    try:
+        return src_file.stat().st_mtime > sub.stat().st_mtime
+    except OSError:
+        return True
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="预处理 CSV 滑动窗口切片（tsai 训练数据准备）")
     parser.add_argument(
@@ -392,6 +414,8 @@ def main(argv: list[str] | None = None) -> int:
         "--workers", type=int, default=None,
         help="并行 worker 数量（默认取 CPU 核心数的一半）",
     )
+    parser.add_argument("--update", action="store_true",
+                        help="增量切片：仅重建源文件比已有窗口更新的股票")
     parser.add_argument("-v", "--verbose", action="store_true", help="输出调试日志")
     args = parser.parse_args(argv)
 
@@ -410,6 +434,13 @@ def main(argv: list[str] | None = None) -> int:
     raw_files = sorted(data_source.glob("*.csv"))
     if args.limit is not None:
         raw_files = raw_files[: args.limit]
+
+    # 增量模式：只重建源预处理文件比现有窗口更新的股票
+    if args.update:
+        before = len(raw_files)
+        raw_files = [f for f in raw_files if needs_reslice(f, dataset_dir)]
+        logging.info("update 模式：共 %d 个源文件，%d 个需要重新切片",
+                     before, len(raw_files))
 
     n_workers = args.workers if args.workers else max(1, (__import__("os").cpu_count() or 1) // 2)
     logging.info("数据源目录: %s（共 %d 个文件）", data_source, len(raw_files))
